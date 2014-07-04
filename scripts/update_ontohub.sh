@@ -48,6 +48,7 @@ rm /tmp/backlog
 old_rev=`cat $deploy_path/current/REVISION || echo -n`
 current_rev=`GIT_DIR=$deploy_path/repo git rev-parse --short $branch`
 
+
 ## compare revisions
 if [ "$old_rev" = "$current_rev" ]; then
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'versions are equal'; fi
@@ -77,10 +78,18 @@ if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to bundle install'; fi
 
 rvm default do bundle --path $deploy_path/shared/bundle --deployment --without development test >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
+  if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
+    echo $current_rev > $deploy_path/current/FAILED_REVISION
+    exit 1
+  fi
   cat /tmp/backlog
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install not successful'; fi
 else
+  if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
+    rm $deploy_path/current/FAILED_REVISION
+    echo 'The error which prevents deploy is fixed'
+  fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install successful'; fi
 fi
 
@@ -98,11 +107,18 @@ bundle config --local without "development:test" > /dev/null
 if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to deploy'; fi
 rvm default do bundle exec cap production deploy >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
+  if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
+    echo $current_rev > $deploy_path/current/FAILED_REVISION
+    exit 1
+  fi
   cat /tmp/backlog
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy not successful'; fi
 else
+  if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
+    rm $deploy_path/current/FAILED_REVISION
+    echo 'The error which prevents deploy is fixed'
+  fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy successful'; fi
   echo $current_rev > $deploy_path/current/REVISION
 fi
-
