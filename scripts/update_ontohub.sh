@@ -33,14 +33,17 @@ fi
 deploy_path=/srv/http/ontohub
 branch=`cat $deploy_path/BRANCH`
 TARGET_EMAIL_ADDRESS="ontohub@luna-wolf.de"
+GIT_ERROR_SUBJECT="An error with git occourd on $branch"
 DEPLOY_ERROR_SUBJECT="deploy error on $branch"
-MESSAGE=/tmp/message.txt
+DEPLOY_ERROR_FIXED="The error which prevents deploy is fixed"
+MESSAGE=/tmp/backlog
 
 
 ## update the local mirror
 GIT_DIR=$deploy_path/repo git remote update >& /tmp/backlog
 if [[ "$?" != "0" ]] ; then
-    cat /tmp/backlog
+    /usr/bin/mail -s "$GIT_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+
 else
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'remote update successful'; fi
 fi
@@ -86,13 +89,13 @@ if [[ "$?" != "0" ]]; then
     echo $current_rev > $deploy_path/current/FAILED_REVISION
     exit 1
   fi
-  /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < /tmp/backlog
+  /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install not successful'; fi
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    echo 'The error which prevents deploy is fixed'
+    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install successful'; fi
 fi
@@ -115,13 +118,13 @@ if [[ "$?" != "0" ]]; then
     echo $current_rev > $deploy_path/current/FAILED_REVISION
     exit 1
   fi
-  cat /tmp/backlog
+  /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy not successful'; fi
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    echo 'The error which prevents deploy is fixed'
+    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy successful'; fi
   echo $current_rev > $deploy_path/current/REVISION
