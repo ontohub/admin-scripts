@@ -35,7 +35,7 @@ branch=`cat $deploy_path/BRANCH`
 
 # mailing stuff #
 #################
-TARGET_EMAIL_ADDRESS="ontohub@luna-wolf.de"
+TARGET_EMAIL_ADDRESS="ontohub-dev-l@ovgu.de"
 GIT_ERROR_SUBJECT="An error with git occourd on $branch"
 DEPLOY_ERROR_SUBJECT="deploy error on $branch"
 DEPLOY_ERROR_FIXED="The error which prevents deploy is fixed"
