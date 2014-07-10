@@ -39,7 +39,7 @@ MESSAGE=/tmp/message.txt
 touch $MESSAGE
 
 echo "foobar" >> $MESSAGE
-/usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < $MESSAGE
+/usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
 
 ## update the local mirror
 GIT_DIR=$deploy_path/repo git remote update >& /tmp/backlog
