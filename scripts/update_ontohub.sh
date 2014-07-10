@@ -15,7 +15,6 @@ source /usr/local/rvm/scripts/rvm
 # |-----------------------------------------|
 # | Avoid this script runnig simultaneously |
 # |-----------------------------------------|
-
 SCRIPTNAME=`basename "$0"`
 LOCK="/tmp/${SCRIPTNAME}.lock"
 exec 8>$LOCK
@@ -31,9 +30,10 @@ fi
 
 # do git stuff #
 ################
-
 deploy_path=/srv/http/ontohub
 branch=`cat $deploy_path/BRANCH`
+TARGET_EMAIL_ADDRESS="ontohub@luna-wolf.de"
+DEPLOY_ERROR_SUBJECT="deploy error on $branch"
 
 ## update the local mirror
 GIT_DIR=$deploy_path/repo git remote update >& /tmp/backlog
@@ -74,6 +74,9 @@ git show "$branch:.ruby-version" > /tmp/bundle-worker/.ruby-version
 
 cd /tmp/bundle-worker
 
+echo "foobar" > /tmp/backlog
+/usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < /tmp/backlog
+
 if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to bundle install'; fi
 
 rvm default do bundle --path $deploy_path/shared/bundle --deployment --without development test >& /tmp/backlog
@@ -82,7 +85,7 @@ if [[ "$?" != "0" ]]; then
     echo $current_rev > $deploy_path/current/FAILED_REVISION
     exit 1
   fi
-  cat /tmp/backlog
+  /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < /tmp/backlog
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install not successful'; fi
 else
