@@ -32,6 +32,9 @@ fi
 ################
 deploy_path=/srv/http/ontohub
 branch=`cat $deploy_path/BRANCH`
+
+# mailing stuff #
+#################
 TARGET_EMAIL_ADDRESS="ontohub@luna-wolf.de"
 GIT_ERROR_SUBJECT="An error with git occourd on $branch"
 DEPLOY_ERROR_SUBJECT="deploy error on $branch"
