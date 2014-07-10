@@ -34,6 +34,7 @@ deploy_path=/srv/http/ontohub
 branch=`cat $deploy_path/BRANCH`
 TARGET_EMAIL_ADDRESS="ontohub@luna-wolf.de"
 DEPLOY_ERROR_SUBJECT="deploy error on $branch"
+MESSAGE=/tmp/message.txt
 
 ## update the local mirror
 GIT_DIR=$deploy_path/repo git remote update >& /tmp/backlog
@@ -74,8 +75,8 @@ git show "$branch:.ruby-version" > /tmp/bundle-worker/.ruby-version
 
 cd /tmp/bundle-worker
 
-echo "foobar" > /tmp/backlog
-/usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < /tmp/backlog
+echo "foobar" > $MESSAGE
+/usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADRESS" < $MESSAGE
 
 if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to bundle install'; fi
 
