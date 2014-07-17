@@ -41,10 +41,19 @@ DEPLOY_ERROR_SUBJECT="deploy error on $branch"
 DEPLOY_ERROR_FIXED="The error which prevents deploy is fixed"
 MESSAGE=/tmp/backlog
 
+# these are errors which not should trigger mail sending
+# to add a new message add '\|string' (whithout ticks)
+# to the string beneath
+########################################################
+EXCLUDED_GIT_ERRORS="unable to connect to github.com"
+
 
 ## update the local mirror
 GIT_DIR=$deploy_path/repo git remote update >& /tmp/backlog
 if [[ "$?" != "0" ]] ; then
+  if grep -q -w "$EXCLUDED_GIT_ERRORS" "$MESSAGE"; then
+   exit 1
+  fi
     /usr/bin/mail -s "$GIT_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
 else
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'remote update successful'; fi
