@@ -106,7 +106,7 @@ if [[ "$?" != "0" ]]; then
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
+    echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install successful'; fi
 fi
@@ -135,7 +135,7 @@ if [[ "$?" != "0" ]]; then
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
+    echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy successful'; fi
   echo $current_rev > $deploy_path/current/REVISION
