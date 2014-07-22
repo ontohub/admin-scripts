@@ -7,7 +7,10 @@
 # You can run this script with -f to force update.
 # If you run it with environment variable MODERN_TALKING to 1,
 # it will produce verbose messages describing what the script is doing.
+# The environment variable NO_MAIL deactivates mail-sending if it is set
+# to 1. The output is then send to STDOUT.
 # EXAMPLE: MODERN_TALKING=1 ./update_ontohub.sh -f
+# EXAMPLE: MODERN_TALKING=1 NO_MAIL=1 ./update_ontohub.sh -f
 
 # needed to load the rvm-function in order to use it later
 source /usr/local/rvm/scripts/rvm
@@ -54,7 +57,11 @@ if [[ "$?" != "0" ]] ; then
   if grep -q -w "$EXCLUDED_GIT_ERRORS" "$MESSAGE"; then
    exit 1
   fi
+  if [[ "$NO_MAIL" == "1" ]]; then
+    cat $MESSAGE
+  else
     /usr/bin/mail -s "$GIT_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+  fi
 else
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'remote update successful'; fi
 fi
@@ -97,7 +104,11 @@ if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to bundle install'; fi
 rvm default do bundle --path $deploy_path/shared/bundle --deployment --without development test >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
   if [[! -e "$deploy_path/current/FAILED_REVISION" ]]; then
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+    if [[ "$NO_MAIL" == "1" ]]; then
+      cat $MESSAGE
+    else
+      /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+    fi
   fi
   rm /tmp/backlog
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install not successful'; fi
@@ -106,7 +117,11 @@ if [[ "$?" != "0" ]]; then
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
+    if [[ "$NO_MAIL" == "1" ]]; then
+      echo $DEPLOY_ERROR_FIXED
+    else
+      echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
+    fi
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install successful'; fi
 fi
@@ -126,7 +141,11 @@ if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to deploy'; fi
 rvm default do bundle exec cap production deploy >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
   if [[! -e "$deploy_path/current/FAILED_REVISION" ]]; then
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+    if [[ "$NO_MAIL" == "1" ]]; then
+      cat $MESSAGE
+    else
+      /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
+    fi
   fi
   rm /tmp/backlog
   echo $current_rev > $deploy_path/current/FAILED_REVISION
@@ -135,7 +154,11 @@ if [[ "$?" != "0" ]]; then
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
+    if [[ "$NO_MAIL" == "1" ]]; then
+      echo $DEPLOY_ERROR_FIXED
+    else
+      echo $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
+    fi
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy successful'; fi
   echo $current_rev > $deploy_path/current/REVISION
