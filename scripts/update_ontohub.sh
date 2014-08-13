@@ -96,7 +96,7 @@ if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to bundle install'; fi
 
 rvm default do bundle --path $deploy_path/shared/bundle --deployment --without development test >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
-  if [[! -e "$deploy_path/current/FAILED_REVISION" ]]; then
+  if [[ ! -e "$deploy_path/current/FAILED_REVISION" ]]; then
     /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
   fi
   rm /tmp/backlog
@@ -104,10 +104,6 @@ if [[ "$?" != "0" ]]; then
   echo $current_rev > $deploy_path/current/FAILED_REVISION
   exit 1
 else
-  if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
-    rm $deploy_path/current/FAILED_REVISION
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
-  fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'bundle install successful'; fi
 fi
 
@@ -125,7 +121,7 @@ bundle config --local without "development:test" > /dev/null
 if [[ "$MODERN_TALKING" == "1" ]]; then echo 'trying to deploy'; fi
 rvm default do bundle exec cap production deploy >& /tmp/backlog
 if [[ "$?" != "0" ]]; then
-  if [[! -e "$deploy_path/current/FAILED_REVISION" ]]; then
+  if [[ ! -e "$deploy_path/current/FAILED_REVISION" ]]; then
     /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $MESSAGE
   fi
   rm /tmp/backlog
@@ -135,7 +131,7 @@ if [[ "$?" != "0" ]]; then
 else
   if [[ -e "$deploy_path/current/FAILED_REVISION" ]]; then
     rm $deploy_path/current/FAILED_REVISION
-    /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS" < $DEPLOY_ERROR_FIXED
+    $DEPLOY_ERROR_FIXED | /usr/bin/mail -s "$DEPLOY_ERROR_SUBJECT" "$TARGET_EMAIL_ADDRESS"
   fi
   if [[ "$MODERN_TALKING" == "1" ]]; then echo 'deploy successful'; fi
   echo $current_rev > $deploy_path/current/REVISION
