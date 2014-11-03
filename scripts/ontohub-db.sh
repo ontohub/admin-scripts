@@ -1,3 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 
-su postgres -c 'psql -d ontohub'
+if [[ "$(whoami)" != 'ontohub' ]]; then
+  su postgres -c 'psql -d ontohub'
+else
+  psql -d ontohub
+fi
