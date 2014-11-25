@@ -1,0 +1,702 @@
+# The contents of this file are subject to the terms of the
+# Common Development and Distribution License (the "License")
+# (see http://www.opensource.org/licenses/CDDL-1.0).
+#
+# Copyright (c) 2012 Jens Elkner. All rights reserved.
+# Use is subject to license terms.
+
+Man.addVar GZPOOL 'The name of the zpool in the global zone, which should be used to create additional zone specific ZFS[s]]. Default is \bpool1\b if available, \brpool\b otherwise. It gets set just for convience (avoid boilerplate code) and is not used within this library.'
+if [[ -z ${GZPOOL} ]]; then
+	if (( USE_ZFS )); then
+		GZPOOL=${ zfs list -H -o name pool1 2>/dev/null ; }
+	else
+		[[ -d /pool1 ]] && GZPOOL=pool1
+	fi
+	[[ -z ${GZPOOL} ]] && GZPOOL=rpool
+fi
+Man.addVar GZPOOL2 'Same as for \bGZPOOL\b but wrt. \bpool2\b. If there is no such pool, it falls back to the value of \b$GZPOOL\b at the time this lib got soiurced in.'
+if [[ -z ${GZPOOL2} ]]; then
+	if (( USE_ZFS )); then
+		GZPOOL2=${ zfs list -H -o name pool2 2>/dev/null ; }
+	else
+		[[ -d /pool2 ]] && GZPOOL2=pool2
+	fi
+	[[ -z ${GZPOOL2} ]] && GZPOOL2=${GZPOOL}
+fi
+
+enum FsTypeE_t=(UNKNOWN INVALID GLOBAL LOCAL DS ZONED LOFS DIR)
+
+typeset -T DatadirObj_t=(
+	typeset -h 'The zfs name in the global zone. Allowed characters are [-_.a-zA-Z0-9/]], but must not start with a dash (-), slash (/) or dot (.) and must not contain any double dot (..) sequence' pool=''
+	typeset -h 'Absolute pathname of the directory/mountpoint within the global zone. Allowed characters are [-_.a-zA-Z0-9/]], but must not start with a dash (-) or dot (.) and must not contain any double dot (..) sequence. Only required, if looback mounted into a zone' dir=''
+	typeset -h 'The zfs name in the non-global zone. Allowed characters are [-_.a-zA-Z0-9/]], but must not start with a dash (-), slash (/) or dot (.) and must not contain any double dot (..) sequence' z_pool='' 
+	typeset -h 'Absolute pathname of the directory/mountpoint within the non-zone. Allowed characters are [-_.a-zA-Z0-9/]], but must not start with a dash (-) or dot (.) and must not contain any double dot (..) sequence.' z_dir=''
+	typeset -i8 -h 'Directory permissions. Same as argument to \bchmod\b(1). If <= 0, the directory permissions stays untouched. NOTE: On Linux you need to prefix octal values with "8#" - a "0" is not sufficient' mode=0
+	typeset -ih 'The UID of the owner of the directory. If negative, the owner UID of the directory stays untouched' uid=-1
+	typeset -ih 'The GID of the owner of the directory. If negative, the owner GID of the directory stays untouched' gid=-1
+	typeset -h 'ZFS properties to set/use. Format: a whitespace separated list of \akey\a=\avalue\a options, as one would specify for "zfs create", but without the \a-o\a switches. E.g. see "zfs get all rpool"' zopts=''
+	typeset -h 'FSType-specific mount options to set/use. Format: a whitespace separated list of options, as one would specify for "mount", but without the \a-o\a switches. See also \bmount\b(1M)' mopts=''
+	typeset -h 'The type of the dataset. Usually determined automatically, avoid setting it manually' fstype=GLOBAL
+	function dump {
+		Log.info "pool='${_.pool}' dir='${_.dir}' z_pool='${_.z_pool}' z_dir='${_.z_dir}' uid=${_.uid} gid=${_.gid} mode=${_.mode:2} fstype='${_.fstype}' zopts='${_.zopts}' mopts='${_.mopts}'"
+	}
+	typeset -fh 'Dump the values of the dataset.' dump
+	function getMask {
+		typeset -i2 CMASK
+		[[ -n ${_.pool} ]] && CMASK=8 || CMASK=0
+		[[ -n ${_.dir} ]] && CMASK+=4
+		[[ -n ${_.z_pool} ]] && CMASK+=2
+		[[ -n ${_.z_dir} ]] && CMASK+=1
+		print $CMASK
+	}
+	typeset -fh 'Get a mask of pool and dir settings. If set, the following value gets added to the mask: pool == 1000; dir == 0100; z_pool == 0010; z_dir == 0001.' getMask 
+)
+
+typeset -T UserObj_t=(
+	typeset -h 'The login name of the user' login=''
+	typeset -h 'The password of the user' pw='LK'
+	typeset -ih 'The UID of the user' uid=0
+	typeset -ih 'The GID of the user' gid=0
+	typeset -h 'The GCOS of the user' gcos=''
+	typeset -h 'The ZFS of the home of the user (zone internal name). Use a single dash "-" to not use a ZFS but a normal directory. Gets set to rpool/local/home/$login if empty' homezfs=''
+	typeset -h 'The home of the user (zone internal mountpoint). Gets set to /local/home/$login if empty' home=''
+	typeset -h 'The shell of the user' shell='/usr/bin/tcsh'
+	typeset -h 'The profile the user should get (exactly as one would specify it in the attr field of /etc/user_attr)' profile=''
+	typeset -h 'The directory wrt. the GZ to use to populate the home of the user. If empty, it gets set to $ADM_SKEL for tcsh, to /etc/skel otherwise.' skeleton=''
+
+	function validate {
+		[[ -z ${_.login} ]] && \
+			Log.fatal "login value of UserObj_t is not set." && return 1
+		[[ -z ${_.pw} ]] && _.pw='LK'
+		(( ! ${_.uid} )) && \
+			Log.fatal "UID of ${_.login} is not set or 0." && return 1
+		(( ! ${_.gid} )) && \
+			Log.fatal "GID of ${_.login} is not set or 0." && return 1
+		[[ -z ${_.homezfs} ]] && _.homezfs="rpool/local/home/${_.login}"
+		if (( ! USE_ZFS )) || [[ ${_.homezfs} == '-' || ${_.home} == '/' ]]
+		then
+			_.homezfs=''
+		fi
+		[[ -z ${_.home} ]] && _.home="/local/home/${_.login}"
+		[[ -z ${_.shell} ]] && _.shell='/usr/bin/tcsh'
+		if [[ -z ${_.skeleton} ]]; then
+			[[ ${_.shell} =~ '/tcsh' ]] && _.skeleton="${ADM_SKEL}" || \
+				_.skeleton='/etc/skel'
+		fi
+		return 0
+	}
+	typeset -fh 'Validate all the settings of this object and add missing values if possible. If a required value is missing a warning gets printed and value 1 returned, otherwise value 0 gets returned' validate
+)
+Man.addVar ZUSER 'An associative array of non-standard accounts to add to the zone. Key is the login name, value a UserObj_t object. Its values get validated and supplemented if possible when \bcheckDatadirsPre()\b gets called. Furthermore \bcheckDatadirsPost()\b calls at its end \bcreateUsers()\b, which also makes use of this array when setting up user homes, passwd/shadow and user_attr entries within the zone.'
+UserObj_t -A ZUSER
+
+typeset -T GroupObj_t=(
+	typeset -h 'The name of the group' name=''
+	typeset -ih 'The GID of the user' gid=-1
+	typeset -h 'All members of the group' members=''
+
+	function validate {
+		[[ -z ${_.name} ]] && \
+			Log.fatal "name value of GroupObj_t is not set." && return 1
+		(( ! ${_.gid} )) && \
+			Log.fatal "GID of ${_.name} is not set or 0." && return 1
+		return 0
+	}
+	typeset -fh 'Validate all the settings of this object. If a required value is missing a warning gets printed and value 1 returned, otherwise value 0 gets returned' validate
+)
+
+Man.addVar ZGROUP 'An associative array of non-standard groups to add to the zone. Key is the group name, value a GroupObj_t object. \bcheckDatadirsPost()\b calls at its end \bcreateGroups()\b to supplement the zone.'
+GroupObj_t -A ZGROUP
+
+Man.addVar DATADIR 'Associative array to denote datasets or directories, which should be available within the global or new non-global zone. Key: An arbitrary string of [-_.a-zA-Z0-9]], but must not start with a dash (-). Value: a DatadirObj_t. Per default all fields are empty. The main purpose is to avoid writing boilerplate code again and again for checking ZFS, directories and generating appropriate zonecfg commands.][+? ]
+[+?Wrt. to its pool,dir and z_pool,z_dir fields only the following combinations make sense/are allowed (i.e. mentioned fields set, others unset):] {
+[(1) dir (mask=0100)?Check/create the directory \adir\a in the GZ (global zone).]
+[(2) z_dir (mask=0001)?Check/create the directory \az_dir\a in the NGZ (non-global zone).]
+[(3) pool (mask=1000)?Check/create the \apool\a in the GZ.]
+[(4) z_pool (mask=0010)?Check/create the \az_pool\a in the NGZ.]
+[(5) pool, dir (mask=1100)?Check/create the \apool\a in the GZ and set its mountpoint to \adir\a.]
+[(6) z_pool, z_dir (mask=0011)?Check/create the \az_pool\a in the NGZ and set its mountpoint to \az_dir\a.]
+[(7) dir, z_dir (mask=0101)?Check/create \adir\a in the GZ and generate the zonecfg command to mount it as a loopback filesystem (LOFS) into the NGZ on \az_dir\a.]
+[(8) pool, z_dir (mask=1001)?Check/create \apool\a in the GZ and generate the zonecfg command to mount it as a ZFS into the NGZ on \az_dir\a.]
+[(9) pool, z_pool (mask=1010)?Check/create \apool\a in the GZ and generate the zonecfg command to pass it as a dataset (virtual zpool) to the NGZ with the name \az_pool\a. Restrictions wrt. to allowed characters (e.g. no slash aka / etc.) are the same as for zpools.]
+} [+? ][+?z_ prefixed fields are always applied wrt. the NGZ aka relative to the NGZ root. \amopts\a make sense for (7) and (8), only - they are just "append" to the \badd option\b command of the related zonecfg. If \bmode\b, \buid\b or \bgid\b are set, the target directory for applying them gets taken from the *dir fields or automatically deduced from the related zfs mountpoint. For more information see '"${SCRIPT##*/}"' -H DatadirObj_t and \bcheckDatadirs*()\b functions.'
+DatadirObj_t -A DATADIR
+
+Man.addFunc checkDatadirNames '' '[+NAME?checkDatadirNames - check strings in \bDATADIR\b]
+[+DESCRIPTION?Checks whether any string values in DATADIR are acceptable wrt. allowed characters, syntax. If any string does not pass the check, exit(2) gets called, otherwise \b0\b returned. It should always be called before using other checkDatadirs*() functions!]
+[+SEE ALSO?\bDATADIR\b, \bcheckDatadirsPre()\b, \bcheckDatadirsPost()\b, \bDatadirObj_t\b]
+'
+function checkDatadirNames {
+	typeset DS X N MSG PRE
+	integer ERROR=0
+	# first make sure, that all have proper names, dir
+	for DS in "${!DATADIR[@]}"; do
+		MSG=''
+		X=${DS//*([-_.a-zA-Z0-9])}		# extract invalid chars
+		if [[ -n $X || ${DS:0:1} == '-' ]]; then
+			MSG+="key '${DS}' "
+			[[ -z $X ]] && MSG+='starts with a dash' \
+			|| MSG+="contains invalid characters '$X'"
+		fi
+		typeset -n D=DATADIR["$DS"]
+
+		N=${D.pool}
+		PRE=",  pool '${N}'"
+		X=${N//*([-_.a-zA-Z0-9\/])}		# extract invalid chars
+		if [[ -n $X ]]; then
+			MSG+="${PRE} contains invalid characters '$X'"
+		elif [[ ${N:0:1} =~ [-/.] ]]; then
+			MSG+="${PRE} starts with a dash or slash or dot"
+		elif [[ $N =~ \.\. ]]; then
+			MSG+="${PRE} contains '..'"
+		fi
+		[[ ${N: -1:1} == '/' ]] && D.pool=${N%%/}	# remove trailing slash
+
+		N=${D.z_pool}
+		PRE=",  z_pool '${N}'"
+		X=${N//*([-_.a-zA-Z0-9\/])}		# extract invalid chars
+		if [[ -n $X ]]; then
+			MSG+="${PRE} contains invalid characters '$X'"
+		elif [[ ${N:0:1} =~ [-/.] ]]; then
+			MSG+="${PRE} starts with a dash or slash or dot"
+		elif [[ $N =~ \.\. ]]; then
+			MSG+="${PRE} contains '..'"
+		fi
+		[[ ${N: -1:1} == '/' ]] && D.z_pool=${N%%/}	# remove trailing slash
+
+		N="${D.dir}"
+		PRE=",  dir '${N}'"
+		X=${N//*([-_.a-zA-Z0-9\/])}		# extract invalid chars
+		if [[ -n $X ]]; then
+			MSG+="${PRE} contains invalid characters '$X'"
+		elif [[ ${N:0:1} =~ [-.] ]]; then
+			MSG+="${PRE} starts with a dash or dot"
+		elif [[ $N =~ \.\. ]]; then
+			MSG+="${PRE} contains '..'"
+		elif [[ -n $N && ${N:0:1} != '/' ]]; then
+			MSG+="${PRE} is not absolute - does not start with a slash"
+		fi
+		[[ ${N: -1:1} == '/' ]] && D.dir=${N%%/}	# remove trailing slash
+
+		N="${D.z_dir}"
+		PRE=",  z_dir '${N}'"
+		X=${N//*([-_.a-zA-Z0-9\/])}		# extract invalid chars
+		if [[ -n $X ]]; then
+			MSG+="${PRE} contains invalid characters '$X'"
+		elif [[ ${N:0:1} =~ [-.] ]]; then
+			MSG+="${PRE} starts with a dash or dot"
+		elif [[ $N =~ \.\. ]]; then
+			MSG+="${PRE} contains '..'"
+		elif [[ -n $N && ${N:0:1} != '/' ]]; then
+			MSG+="${PRE} is not absolute - does not start with a slash"
+		fi
+		[[ ${N: -1:1} == '/' ]] && D.z_dir=${N%%/}	# remove trailing slash
+
+		# coarse grained no whitespace check, remove any mount critical opts
+		for X in ${D.zopts} ; do
+			[[ $X =~ =$ ]] && MSG+=",  zopts: ZFS option '$X' has no value"
+			[[ $X =~ ^(zoned|mountpoint|canmount)= ]] && \
+				D.zopts="${D.zopts//@(mountpoint|zoned|canmount)=*([^[:space:]])}"
+		done
+		if [[ -z ${D.pool} && -z ${D.dir} && -z ${D.z_pool} && -z ${D.z_dir} ]]
+		then
+			MSG+=",  no pool|dir|z_pool|z_dir set."
+		fi
+
+		[[ -n ${MSG} ]] && Log.fatal "DATADIR[${DS}] - ${MSG#,  }." && \
+			DS.fstype=INVALID  && ((ERROR++))
+		unset -n D
+	done
+	(( ERROR )) && exit 2
+	return 0
+}
+
+typeset -r -i8 -A PERM_USER=( [r]=8#0400 [w]=8#0200 [x]=8#0100 [S]=8#04000 [s]=8#04100 [-]=0 )
+typeset -r -i8 -A PERM_GROUP=( [r]=8#040 [w]=8#020 [x]=8#010 [L]=8#2000 [l]=8#2000 [S]=8#012000 [s]=8#2010 [-]=0 )
+typeset -r -i8 -A PERM_OTHER=( [r]=8#04 [w]=8#02 [x]=8#01 [T]=8#01000 [t]=8#01001 [-]=0 )
+
+Man.addFunc setDirPermissions '' '[+NAME?setDirPermissions - set owner and permission of a directory.]
+[+DESCRIPTION?Checks, whether the given \aDIR\a in the given \azoneName\a exists. If it does not exists and the related \aDATASET\a contains zone settings and \aisPost\a is empty the function returns with 0 immediately, otherwise with 1. If \aDIR\a exists, this function changes its owner/group and permissions according to the \buid\b, \bgid\b and \bmode\b fields of \bDATADIR[\b\a$KEY\a\b]]\b. If a field is < 0 it is ignored. If \azoneName\a is != \bglobal\b, zlogin \a$ZNAME\a will be used to execute appropriate commands.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DATADIR ZNAME; }" '}
+[+RETURN CODE?> 0 if an error occured, 0 otherwise.]\n\n\azoneName\a \aDIR\a \aKEY\a [\aisPost\a]\n\n'
+function setDirPermissions {
+	typeset DIR="$2" PREFIX=''
+	[[ -z $3 ]] && print "Missing arg3 (DATADIR key) for setDirPermissions() - skipping $DIR" && return 1
+	[[ -z $2 ]] && print "Missing arg2 (DIR) for setDirPermissions() - skipping $DIR" && return 1
+	[[ -z $1 ]] && print "Missing arg1 (zoneName) for setDirPermissions() - skipping $DIR" && return 1
+	[[ $1 != 'global' ]] && PREFIX="zlogin $1 "
+	typeset -n DS=DATADIR["$3"]
+	integer ERROR=0 I
+	typeset -i8 MODE
+	typeset LS=( ${ ${PREFIX} ls -ldn ${DIR} 2>/dev/null ; } )
+	if (( ${#LS[@]} == 0 )); then
+		typeset CMASK=${ DS.getMask; }
+		# don't warn, if it is NGZ related and not in post check
+		if (( ( CMASK & 2#0011 ) == 0 )) || [[ -n $4 ]] ; then
+			Log.warn "${DIR} does not exist or is not yet mounted." \
+				"Skipping dir permission check/set on DATADIR[$3]."
+			return 1
+		fi
+		return 0
+	fi
+	if (( ${DS.uid} >= 0 && ${DS.gid} >= 0 )); then
+		if (( $LS[2] != ${DS.uid} || ${LS[3]} != ${DS.gid} )); then
+			${PREFIX} chown ${DS.uid}:${DS.gid} "${DIR}" || (( ERROR++ ))
+		fi
+	elif (( ${DS.gid} >= 0 )); then
+		if (( ${LS[2]} != ${DS.gid} )); then
+			${PREFIX} chown ${DS.uid} "${DIR}" || (( ERROR++ ))
+		fi
+	elif (( ${DS.gid} >= 0 )); then
+		if (( ${LS[3]} != ${DS.gid} )); then
+			${PREFIX} chgrp ${DS.gid} "${DIR}" || (( ERROR++ ))
+		fi
+	fi
+	MODE=0
+	if (( DS.mode > 0 )); then
+		for I in {1..3}; do (( MODE+=${PERM_USER[${LS[0]:$I:1}]} )) ; done
+		for I in {4..6}; do (( MODE+=${PERM_GROUP[${LS[0]:$I:1}]} )) ; done
+		for I in {7..9}; do (( MODE+=${PERM_OTHER[${LS[0]:$I:1}]} )) ; done
+		if (( MODE != DS.mode )); then
+			DS.dump
+			Log.info "Permission mismatch: ${DIR} ${MODE} != ${DS.mode}"
+			${PREFIX} chmod ${DS.mode:2} "${DIR}" || (( ERROR++ ))
+		fi
+	fi
+	return ${ERROR}
+}
+
+Man.addFunc setZfsProperty '' '[+NAME?setZfsProperty - applies properties to a ZFS.]
+[+DESCRIPTION?Sets each given ZFS property (\akey\a) to the corresponding \avalue\a of the given \aZFS\a, if its current value differs from the given one. If \azoneName\a != \bglobal\b zlogin will be used to execute appropriate commands.]
+\n\n\azoneName\a ZFS\a \akey\a=\avalue\a ...\n\n
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME; }" '}
+[+SEE ALSO?\bzfs\b(1M), \bzlogin\b(1M)]'
+function setZfsProperty {
+	(( ! USE_ZFS )) && return
+	typeset PAIR VAL ZFS="$2" PREFIX=''
+	typeset -A OPTS TODO
+	[[ -n $1 && $1 != 'global' ]] && PREFIX="zlogin $1 "
+	shift 2
+	[[ -z ${ZFS} || -z $1 ]] && return 0
+	for PAIR in $* ; do
+		VAL=${PAIR#*=}
+		[[ ${VAL} == ${PAIR} ]] && continue	# no key=value
+		(( ${#VAL} > 1 )) && OPTS[${.sh.match%=}]=${VAL}
+	done
+	(( ${#OPTS[@]} == 0 )) && return 0
+	VAL=${!OPTS[@]}
+	${PREFIX} zfs get -H -o property,value ${VAL// /,} ${ZFS} | \
+	while read KEY VAL; do
+		[[ ${OPTS[${KEY}]} != "$VAL" ]] && TODO[${KEY}]=${OPTS[${KEY}]}
+	done
+	(( ${#TODO[*]} == 0 )) && return 0
+	for KEY in ${!TODO[*]}; do
+		${PREFIX} zfs set ${KEY}=${TODO[${KEY}]} ${ZFS}
+	done
+}
+
+function createGroups {
+	typeset X
+	for X in "${!ZGROUP[@]}" ; do
+		ZGROUP[$X].validate || continue
+		grep -q ^${X}: ${ZROOT}/etc/group || \
+			print "${X}:x:${ZGROUP[$X].gid}:${ZGROUP[$X].members}" \
+				>>${ZROOT}/etc/group
+	done
+}
+
+function createUsers {
+	typeset U F ZUHOME
+	(( ${#ZUSER[@]} )) || return
+	for U in "${!ZUSER[@]}"; do
+		ZUSER[$U].validate || continue
+		ZUHOME="${ZUSER[$U].home}"
+		print "${ZUSER[$U].login}:x:${ZUSER[$U].uid}:${ZUSER[$U].gid}:${ZUSER[$U].gcos}:${ZUHOME}:${ZUSER[$U].shell}" \
+			>>${ZROOT}/etc/passwd
+		print "${ZUSER[$U].login}:${ZUSER[$U].pw}:::::::" >>${ZROOT}/etc/shadow
+		if [[ ${ZUHOME} != '/' ]]; then
+			[[ -z ${ZUSER[$U].skeleton} || ! -d "${ZUSER[$U].skeleton}" || \
+				! -d "${ZROOT}/${ZUHOME}" ]] && continue
+			# on Ubuntu pax is not POSIX conform and thus useless, i.e.
+			#pax -rwLlk -o gid=${ZUSER[$U].gid} -o uid=${ZUSER[$U].uid}
+			# does not work
+			( cd "${ZUSER[$U].skeleton}" && \
+				find . -depth -print | cpio -puvmd "${ZROOT}/${ZUHOME}"
+			)
+			find ${ZROOT}/${ZUHOME} \( -type d -o -type f \) \
+				-exec chown ${ZUSER[$U].uid}:${ZUSER[$U].gid} {} \;
+			[[ ! -d ${ZROOT}/${ZUHOME}/.ssh && -d ~admin/.ssh ]] && \
+				mkdir ${ZROOT}/${ZUHOME}/.ssh && \
+					cp ~admin/.ssh/authorized_keys2 ${ZROOT}/${ZUHOME}/.ssh/
+			for F in .history .ssh/authorized_keys2 ; do
+				[[ -f "${ZROOT}/${ZUHOME}/$F" ]] && \
+					chmod 0600 "${ZROOT}/${ZUHOME}/$F"
+			done
+			for F in .ssh ; do
+				[[ -d "${ZROOT}/${ZUHOME}/$F" ]] && \
+					chmod 0700 "${ZROOT}/${ZUHOME}/$F"
+			done
+			rm -f ${ZROOT}/${ZUHOME}/etc/{log,man,utils,datadir}.kshlib\
+				${ZROOT}/${ZUHOME}/etc/gzip
+			# hmm - ubuntu ...
+			find ${ZROOT}/${ZUHOME} \( -type d -o -type f \) -exec chown ${ZUSER[$U].uid}:${ZUSER[$U].gid} {} \;
+		fi
+		[[ -n ${ZUSER[$U].profile} && -f ${ZROOT}/etc/user_attr ]] && \
+			print "${ZUSER[$U].login}::::${ZUSER[$U].profile}" \
+				>>"${ZROOT}/etc/user_attr"
+	done
+}
+
+Man.addFunc checkDatadirsPre '' '[+NAME?checkDatadirsPre - check and optionaly create missing datasets and directories in the global zone.]
+[+DESCRIPTION?Checks all \aDATADIR\a entries, and tries to create missing ZFS and directories in the global zone (to create ZFS and directories within the non-global zone, one should call \bcheckDatadirsPost()\b \aafter\a the zone got installed). If ambiguous, invalid or overconstraint combinations of [z_]]pool and [z_]]dir are encountered, this function logs the problem and calls \bexit()\b! If the related ZFS or directory exists, their properties/permissions gets compared with the settings in the corresponding DATADIR entry and adjusted if necessary. Finally the \bfstype\b value gets set to a value to indicate, what actions to use if one needs to create a zoneconfig. So one should not change this value afterwards]
+[+?\bNOTE:\b Depending on the ZFS settings, a call to \bchmod\b(1) may remove all previously added ACLs and reset it to the default ACL list before applying the given mask. So be careful using \buid\b, \bgid\b and \bmode\b fields! Furthermore if ZFS is not available, related ZFS properties are silently ignored and the ZFS name prefixed with a "/" is used as corresponding directory name.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DATADIR; }" '}
+[+SEE ALSO?\bDATADIR\b, \bcheckDatadirNames()\b, \bcheckDatadirsPost()\b, \bDatadirObj_t\b, \bsetZfsProperty()\b, \bsetDirPermissions()\b]
+'
+function checkDatadirsPre {
+	if (( ${#ZUSER[@]} )); then
+		# create a DATADIR[user_$name] entry for each add. user with a zfs
+		for U in "${!ZUSER[@]}"; do
+			ZUSER[$U].validate || continue
+			[[ ${ZUSER[$U].home} != '/' ]] && \
+				DATADIR["user_${ZUSER[$U].login}"]=(
+					z_pool=${ZUSER[$U].homezfs} z_dir=${ZUSER[$U].home}
+					mode=8#0755 uid=${ZUSER[$U].uid} gid=${ZUSER[$U].gid}
+				)
+		done
+	fi
+
+	checkDatadirNames
+	Log.info 'Pre-checking datadirs ...'
+	typeset CMD KEY KEY_NAME ZFS GDIR TODO='' GZ_NAMES='' CDIR \
+		FSTAB='' LINE E M=''
+	typeset -A -i2 MASK
+	typeset -i2 CMASK F
+	# Handle GZ ZFS first, so that if a parent gets created, the children
+	# inherit properties correctly
+	for KEY in ${!DATADIR[@]}; do
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${ DS.getMask; }
+		if (( CMASK == 0 || \
+			CMASK == 2#1111 || CMASK == 2#1110 || CMASK == 2#1011 || \
+			CMASK == 2#1101 || CMASK == 2#0110 || CMASK == 2#0111 ))
+		then
+			# actually we could apply a little bit more logic and possibly
+			# do the right thing wrt. availability in the zone. But this might
+			# not be, what is desired.
+			DS.fstype=UNKNOWN && continue
+			Log.fatal "DATADIR[${KEY}] is overconstrained/ambiguous." \
+				"${ print -r DS; }"&& exit 3
+		fi
+		MASK[${KEY}]=${CMASK}
+		(( CMASK & 8 )) && GZ_NAMES+=" ${KEY}:${DS.pool}" || TODO+=" ${KEY}"
+	done
+	# Is there something todo wrt. the global zone? If so, handle parents 1st.
+	[[ -n ${GZ_NAMES} ]] && \
+		GZ_NAMES=${ print "${GZ_NAMES// /$'\n'}" | sort -t: -k2; }
+	(( ${TEST:-0} )) && print ${GZ_NAMES}
+
+	# Handle GZ ZFS: basically create if not exist + set props & perms
+	F=0
+	for KEY_NAME in ${GZ_NAMES} ; do
+		# 2#1000|2#1100|2#1001|2#1010
+		CDIR=''
+		KEY=${KEY_NAME%:*}
+		ZFS=${.sh.match:1}						# ZFS name wrt. the GZ
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${MASK[${KEY}]}
+		if (( USE_ZFS )); then
+			GDIR=${ zfs list -H -o mountpoint ${ZFS} 2>/dev/null; }
+		elif [[ -d /${ZFS} ]]; then
+			GDIR="/${ZFS}"	# even if bound somewhere else, should be still ok
+		else
+			GDIR=''
+		fi
+		if [[ -z ${GDIR} ]]; then
+			# to avoid accidents, we wanna have an existing parent zfs|dir != /
+			if (( USE_ZFS )); then
+				[[ ! ${ZFS} =~ '/' ]] && \
+					Log.fatal "ZFS pool '${ZFS}' does not exist." && exit 3
+				# otherwise 
+				CMD="zfs create "
+				[[ -n ${DS.zopts} ]] && CMD+="-o ${DS.zopts//+([[:space:]])/ -o} "
+				(( CMASK & 2#0100 )) && CMD+="-o mountpoint=${DS.dir} "
+				${CMD} -p ${ZFS} || exit 3
+				(( ! (CMASK & 2#0100) )) && \
+					CDIR=${ zfs list -H -o mountpoint ${ZFS} 2>/dev/null; }
+				# might not be mounted -> fail -> re-try in post
+			else
+				[[ ! ${ZFS} =~ '/' ]] && \
+					Log.fatal "ZFS pool '${ZFS}' does not exist." && exit 3
+				# ignore possible ZFS properties
+				mkdir -p /${ZFS} || exit 3
+				if (( CMASK & 2#0100 )) && [[ ${DS.dir} != /${ZFS} ]]; then
+					mkdir -p ${DS.dir}
+					setDirPermissions 'global' "${DS.dir}" "${KEY}"
+				fi
+				CDIR="/${ZFS}"
+			fi
+		else
+			setZfsProperty 'global' ${ZFS} "${DS.zopts}"
+			CDIR="${GDIR}"
+		fi
+		[[ -z ${CDIR} ]] && CDIR="${DS.dir}"
+		setDirPermissions 'global' "${CDIR}" "${KEY}"
+		if (( CMASK == 2#1000 || CMASK == 2#1100 )); then
+			DS.fstype=GLOBAL
+		elif (( CMASK == 2#1001 )); then
+			DS.fstype=ZONED
+		else # 2#1010
+			DS.fstype=DS
+		fi
+	done
+	(( F )) && Log.info "/etc/fstab modified for /${ZFS}"
+
+	# Handle non-GZ ZFS: basically consist. checks and prep. for post
+	for KEY in ${TODO}; do
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${MASK[${KEY}]}
+		if (( CMASK == 2#0110 )); then	# actually already handled on entry
+			Log.fatal "DATADIR[${KEY}] is invalid (dir -> zfs)." \
+				"${ print -r DS; }" && exit 3
+		elif (( CMASK < 2#0100 )); then
+			# need to do in post
+			(( CMASK == 1 )) && DS.fstype=DIR || DS.fstype=LOCAL
+		else # 2#0100|2#0101
+			[[ ! -d ${DS.dir} ]] && mkdir -p ${DS.dir} || exit 3
+			setDirPermissions 'global' "${DS.dir}" ${KEY}
+			(( CMASK == 2#0101 )) && DS.fstype=LOFS || DS.fstype=DIR
+		fi
+	done
+}
+
+Man.addFunc checkDatadirsPost '' '[+NAME?checkDatadirsPost - check and optionally create missing directories in the global and missing ZFS or directories in the non-global zone and finally add all accounts denoted by \bZUSERS\b, if any.]
+[+DESCRIPTION?Checks all \aDATADIR\a entries, and tries to create missing ZFS and directories in the non-global zone (to create ZFS and directories within the global zone, one should call \bcheckDatadirsPre()\b \abefore\a the zone gets installed). If ambiguous, invalid or overconstraint combinations of [z_]]pool and [z_]]dir are encountered, this function logs the problem and skips processing the entry! If the related ZFS or directory exists, its properties/permissions gets compared with the settings in the corresponding DATADIR entry and adjusted if necessary. The non-global zone must be in \brunning\b state if entries refer to it.]
+[+?\bNOTE:\b Depending on the ZFS settings, a call to \bchmod\b(1) may remove all previously added ACLs and reset it to the default ACL list before applying the given mask. So be careful using \buid\b, \bgid\b and \bmode\b fields!]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DATADIR ZNAME; }" '}
+[+SEE ALSO?\bcheckDatadirNames()\b, \bcheckDatadirsPre()\b, \bDatadirObj_t\b, \bsetZfsProperty()\b, \bsetDirPermissions()\b]'
+function checkDatadirsPost {
+	( checkDatadirNames )
+
+	Log.info 'Post-checking datadirs ...'
+	typeset KEY KEY_NAME ZFS GDIR CMD TODO='' GZ_NAMES='' CDIR ZONE A X
+	typeset -i2 CMASK
+	typeset -i2 -A MASK
+	# as above: make sure GZ gets handled before non-GZ ZFS
+	for KEY in ${!DATADIR[*]}; do
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${ DS.getMask; }
+		# Just in case a "genius" is @work ...
+		if (( CMASK == 0 || \
+			CMASK == 2#1111 || CMASK == 2#1110 || CMASK == 2#1011 || \
+			CMASK == 2#1101 || CMASK == 2#0110 || CMASK == 2#0111 ))
+		then
+			Log.warn "Ignoring overconstrained/ambiguous DATADIR[$KEY] ($CMASK)"
+			DS.fstype=UNKNOWN && continue
+		fi
+		MASK[${KEY}]=${CMASK}
+		(( CMASK & 8 )) && GZ_NAMES+=" ${KEY}:${DS.pool}" || TODO+=" ${KEY}"
+	done
+	[[ -n ${GZ_NAMES} ]] && \
+		GZ_NAMES=${ print "${GZ_NAMES// /$'\n'}" | sort -t: -k2 ; }
+
+	# handle GZ ZFS
+	for KEY_NAME in ${GZ_NAMES} ; do
+		# 2#1000|2#1100|2#1001|2#1010
+		# We go through again, because now all related ZFS should be mounted.
+		# and install might have changed some properties, permissions.
+		# So, we do not create, just check ZFS properties and dir perms.
+		KEY=${KEY_NAME%:*}
+		ZFS=${.sh.match:1}
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${MASK[${KEY}]}
+		# 1000 1001 1010 1100
+		if (( USE_ZFS )) ; then
+			CDIR=${ zfs list -H -o mountpoint ${ZFS} 2>/dev/null; }
+		else
+			CDIR=/${ZFS}	# even if bound somewhere else, should be still ok
+		fi
+		if [[ -z ${CDIR} ]]; then
+			Log.warn "Ignoring ${ZFS} from DATADIR[${KEY}] - does not exist."
+			continue
+		fi
+		setZfsProperty 'global' "${ZFS}" "${DS.zopts}"
+		ZONE='global'
+		# since S11.1 mountpoint property is not in sync with the real current
+		# mountpoint, when the zone comes up! So we need zlogin :(
+		if (( CMASK == 2#1001 )) ; then
+			ZONE=${ZNAME}
+			CDIR=${DS.z_dir}
+		elif (( CMASK == 2#1010 )) ; then
+			ZONE=${ZNAME}
+			# should be /${DS.z_pool} but who knows, what else is fucked up
+			if (( USE_ZFS )); then
+				CDIR=${ zlogin ${ZNAME} zfs list -H -o mountpoint  ${DS.z_pool}  2>/dev/null; }
+			else
+				CDIR=/${DS.z_pool}
+			fi
+		fi
+		setDirPermissions ${ZONE} "${CDIR}" "${KEY}" 1
+	done
+
+	# Handle non-GZ: ZFS before dirs to avoid "directory not empty" problems.
+	# In theory we could do most things without zlogin, however, we don't know,
+	# whether this will change in future. So we take the save route and can
+	# be sure, that the zone is running ...
+	GZ_NAMES='' ; GDIR=''
+	# 0001 0010 0011 0100 0101
+	for KEY in ${TODO}; do
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${MASK[${KEY}]}
+		(( CMASK & 2#0010 )) && \
+			GZ_NAMES+=" ${KEY}:${DS.z_pool}" || GDIR+=" ${KEY}"
+	done
+	[[ -n ${GZ_NAMES} ]] && \
+		GZ_NAMES=${ print "${GZ_NAMES// /$'\n'}" | sort -t: -k2; }
+	for KEY_NAME in ${GZ_NAMES} ; do
+		# 0010 0011
+		KEY=${KEY_NAME%:*}
+		ZFS=${.sh.match:1}
+		typeset -n DS=DATADIR[${KEY}]
+		CMASK=${MASK[${KEY}]}
+		if (( USE_ZFS )) ; then
+			CDIR=${ zlogin ${ZNAME} zfs list -H -o mountpoint ${ZFS} 2>/dev/null; }
+		else
+			A=( ${ zlogin ${ZNAME} ls -d /${ZFS} 2>/dev/null ; } )
+			[[ -n ${A[0]} ]] && CDIR=/${ZFS}
+		fi
+		if [[ -z ${CDIR} ]]; then
+			[[ ! ${ZFS} =~ '/' ]] && \
+				Log.warn "ZFS pool '${ZFS}' does not exist - ignored." && \
+				continue
+			if (( USE_ZFS )); then
+				CMD="zlogin ${ZNAME} zfs create "
+				[[ -n ${DS.zopts} ]] && \
+					CMD+="-o ${DS.zopts//+([[:space:]])/ -o} "
+				(( CMASK & 1 )) && CMD+="-o mountpoint=${DS.z_dir} "
+				CMD+=" -p ${ZFS}"
+			else
+				CMD="zlogin ${ZNAME} mkdir -p /${ZFS}"
+			fi
+			if ! ${CMD} ; then
+				Log.warn "Creating zone ZFS '${ZFS}' failed."
+				continue
+			fi
+			if (( CMASK == 2#0011 && ! USE_ZFS )) ; then
+				A=( ${ zlogin ${ZNAME} ls -d ${DS.z_dir} 2>/dev/null ; } )
+				if [[ -z ${A[0]} ]]; then
+					zlogin ${ZNAME} mkdir -p "${DS.z_dir}"
+					setDirPermissions "${ZNAME}" "${DS.z_dir}" "${KEY}"
+				fi
+			fi
+		else
+			setZfsProperty "${ZNAME}" "${ZFS}" "${DS.zopts}"
+		fi
+		[[ -z ${CDIR} ]] && CDIR="${DS.z_dir}"
+		[[ -z ${CDIR} ]] && CDIR=${ zlogin "${ZNAME}" \
+			zfs list -H -o mountpoint ${ZFS} 2>/dev/null; }
+		setDirPermissions "${ZNAME}" "${CDIR}" "${KEY}" 1
+	done
+
+	# now we can check dirs and create if not already there
+	for KEY in $GDIR; do
+		# 0001 0100 0101
+		typeset -n DS=DATADIR[${KEY}]
+        CMASK=${MASK[${KEY}]}
+		if (( CMASK & 2#0100 )); then
+			if [[ ! -d ${DS.dir} ]]; then
+				if ! mkdir -p ${DS.dir} ; then
+					Log.warn "Skipping DATADIR[${KEY}]" 
+					continue
+				fi
+			fi
+			setDirPermissions 'global' "${DS.dir}" "${KEY}" 1
+		fi
+		if (( CMASK & 2#0001 )); then
+			# 2#0001 || 2#0101
+			CDIR=${ zlogin "${ZNAME}" ls -ldn ${DS.z_dir} 2>/dev/null; }
+			if [[ -z ${CDIR} ]]; then
+				if ! zlogin "${ZNAME}" mkdir -p ${DS.z_dir} ; then
+					Log.warn "Skipping DATADIR[${KEY}]"
+					continue
+				fi
+			fi
+			setDirPermissions "${ZNAME}" "${DS.z_dir}" "${KEY}" 1
+		fi
+	done
+	# finally
+	createGroups
+	createUsers
+}
+
+function addDataDirs2lxc {
+	# Linux lxc-create is totally dumb and we need to manually plumb all fs
+	# except NGZ /.  For zfs everything should be ok by setting the mount point
+	# correctly, however, this hasn't been tested yet (ZoL n/a).
+	# So USE_ZFS support needs plumbing + state of ZoL impl. research
+	typeset -n CFG=$1 HOOK=$2
+	typeset KEY
+	typeset -i2 CMASK
+	typeset -l FSTYPE
+	for KEY in ${!DATADIR[*]}; do
+		typeset -n DS=DATADIR[${KEY}]
+		#DS.dump
+		FSTYPE=${DS.fstype}
+		CMASK=${ DS.getMask; }
+		if (( CMASK == 2#0011 )); then
+			(( USE_ZFS )) && Log.warn 'Unsupported case NGZ_zfs->NGZ_dir' || \
+				HOOK+="/${DS.z_pool}\t${DS.z_dir}\tnone\trbind\t0 2\n"
+		elif (( CMASK == 2#0101 )); then	# GZ_dir->NGZ_dir
+			CFG+="${DS.dir}\t${DS.z_dir#/}\tnone\trbind\t0 2\n"
+		elif (( CMASK == 2#1001 )); then
+			(( USE_ZFS )) && Log.warn 'Unsupported case GZ_zfs->NGZ_dir' || \
+				CFG+="/${DS.pool}\t${DS.z_dir#/}\tnone\trbind\t0 2\n"
+		elif (( CMASK == 2#1010 )); then
+			(( USE_ZFS )) && Log.warn 'Unsupported case GZ_zfs->NGZ_zfs' || \
+				CFG+="/${DS.pool}\t${DS.z_pool}\tnone\trbind\t0 2\n"
+		fi
+	done
+}
+
+Man.addFunc addDataDirs2zone '' '[+NAME?addDataDirs2zone - print out the zonecfg command to add all DATADIR related filesystems and datasets]
+[+DESCRIPTION?Iterates through \a$DATADIR\a and emits the \bzonecfg\b(1M) commands for all relevant entries. It relies on information produced by \bcheckDatadirsPre()\b!]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DATADIR; }" '}
+[+SEE ALSO?\bcheckDatadirsPre()\b, \bDatadirObj_t\b]'
+function addDataDirs2zone {
+	if [[ ${ uname -s ; } != 'SunOS' ]]; then
+		typeset -n CFGFSTAB=$1 HOOKFSTAB=$2
+		addDataDirs2lxc CFGFSTAB HOOKFSTAB
+		return $?
+	fi
+	typeset KEY SPECIAL OPTS
+	typeset -l FSTYPE
+	for KEY in ${!DATADIR[*]}; do
+		typeset -n DS=DATADIR[${KEY}]
+		FSTYPE=${DS.fstype}
+		[[ ${FSTYPE} == 'zoned' ]] && FSTYPE='zfs'
+		if [[ ${FSTYPE} == 'zfs' || ${FSTYPE} == 'lofs' ]]; then
+			[[ -n ${DS.mopts} ]] && \
+				OPTS=$'\n\tadd options [${DS.mopts//+([[:space:]])/,}]\n'
+			[[ ${FSTYPE} == zfs ]] && SPECIAL=${DS.pool} || SPECIAL=${DS.dir}
+			# loopback mount zfs or dir (special) on the zone's dir 
+			print '
+add fs
+	set dir='"${DS.z_dir}"'
+	set special='"${SPECIAL}"'
+	set type='"${FSTYPE}${OPTS}"'
+end
+'
+		elif [[ ${FSTYPE} == ds ]]; then 
+			# completely inherit the ZFS as "virtual pool" to the zone with the
+			# aliased name
+			print '
+add dataset
+	set name='"${DS.pool}"'
+	set alias='"${DS.z_pool}"'
+end
+'
+		fi
+	done
+}
+
+# vim:ts=4 filetype=sh
