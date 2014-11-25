@@ -26,3 +26,7 @@ How to call it this way you see in the Example below:
 ```bash
 MODERN_TALKING=1 ./update_ontohub.sh -f
 ```
+
+## install
+
+In this folder, install scripts are being prepared. Still experimental!
