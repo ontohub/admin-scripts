@@ -1,0 +1,745 @@
+#!/bin/ksh93
+
+############################################################################
+# "bootstrap" stuff
+############################################################################
+typeset -r LIBNAME="${.sh.file}"
+. ${LIBNAME%/*}/log.kshlib
+. ${LIBNAME%/*}/man.kshlib
+
+Man.addVar SCRIPT 'The full path of the running script. (read-only)'
+typeset -r SCRIPT=$( cd ${ dirname $0 }; print -n "$PWD/${ basename $0; }"; )
+
+Man.addVar SDIR 'Base directory which contains all relevant files (manifests, profiles, etc.) required to setup zones. Default: the directory which contains this running script (see \a$SCRIPT\a).'
+[[ -z $SDIR ]] && SDIR=${SCRIPT%/*}
+cd $SDIR
+
+. ${LIBNAME%/*}/utils.kshlib
+
+
+############################################################################
+# main environment
+############################################################################
+integer USE_ZFS=0
+# all or nothing
+if [[ -n ${ whence zfs ; } && -n ${ zfs list -H -o name rpool 2>/dev/null ; } ]]
+then
+	USE_ZFS=1
+	if [[ ${ uname -s ; } != 'SunOS' ]]; then
+		Log.warn "ZFS on Linux may work but is not yet supported!"
+		Log.warn 'Switching back to "dir" mode only.'
+		USE_ZFS=0
+	else
+		Log.info 'Using ZFS mode ..'
+	fi
+fi
+typeset -r USE_ZFS	# now tag RO
+
+Man.addVar ZNAME 'The name of the zone to be [un]]installed. Default: \a$SCRIPT\a with suffix \b-lxcsetup.ksh\b and trailing dot components removed.'
+if [[ -z ${ZNAME} ]]; then
+	typeset ZNAME=${SCRIPT%-lxcsetup.ksh}
+	if [[ ${ZNAME} == ${SCRIPT} ]]; then
+		ZNAME=''
+	else
+		ZNAME=${ZNAME##*/}
+		ZNAME=${ZNAME%%.*}
+	fi
+else
+	[[ ${ZNAME} == ${SCRIPT} ]] && ZNAME='' || ZNAME=${ZNAME##*/}
+fi
+if [[ -z ${ZBASE} && -r /etc/lxc/lxc.conf ]]; then
+	while read A B C ; do
+		[[ $A == 'lxc.lxcpath' && -n $C ]] && ZBASE="$C" && break
+	done </etc/lxc/lxc.conf
+	unset A B C
+fi
+[[ -z ${ZBASE} ]] && ZBASE='/zones'
+Man.addVar ZBASE 'Absolute path of the directory where zones get mounted. Convention: \b/zones\b. It should be a ZFS. Can be set before sourcing this lib, but not later!'
+
+Man.addVar ZPATH 'Absolute path wrt. global zone, where the new zone should be mounted. Default and Convention: \a$ZBASE/$ZNAME\a.'
+# Just defined here, to get hte default listed when called with -l. Gets
+# overwritten in checkZonePathes()
+typeset ZPATH="$ZBASE/$ZNAME"
+
+Man.addVar ROOT 'The name of the directory containing the / of the zone relative to the mountpoint of the zone. For LXC this is \brootfs\b, for Solaris zones it is \broot\b.'
+typeset -r ROOT='rootfs'
+
+Man.addVar ZROOT 'For convinience (avoid boilerplate code/clutter) ${ZPATH}/${ROOT}.'
+typeset -r ZROOT="${ZPATH}/${ROOT}"
+
+. ${LIBNAME%/*}/datadir.kshlib
+
+Man.addVar LNX_CODENAME 'The release codename of the linux distribution on the host (see lsb_release -c). (lxc specific)'
+if [[ -z ${LNX_CODENAME} ]]; then
+	LNX_CODENAME=${ lsb_release -c ; }
+	LNX_CODENAME=${LNX_CODENAME##~(E).*[[:space:]]+}
+fi
+
+[[ -z ${URL_SCRIPT} ]] && URL_SCRIPT='http://pkg.iws.cs.ovgu.de/cgi-bin/ubuntu' 
+Man.addVar URL_SCRIPT 'The http script we use to get zone specific scripts and settings. Default: '"${URL_SCRIPT}"
+
+Man.addFunc fetchPost '' '[+NAME?fetchPost - fetch config and install related scripts/settings.]
+[+DESCRIPTION?Appends params (if any) as is to \b$URL_SCRIPT\b and fetches its content via a GET request. If \ascript\a is empty or ends with a "/", script gets set to "preseed.cfg". The received content gets stored into file having the basenae of \ascript\a in the \b$TMPDIR\b directory.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage URL_SCRIPT TMPDIR; }" '}
+[+SEE ALSO?\bcreateTempdir()\b]
+\n\n\ascript\a [\aparams\a]
+'
+function fetchPost {
+	#?post&hname=${FQHN}"
+	[[ -z ${TMPDIR} ]] && { createTempdir || return 1 ; }
+	typeset SCRIPT="${1##*/}" URL="${URL_SCRIPT}"
+	[[ -n "$2" ]] && URL+="?${2#\?}"
+	[[ -z ${SCRIPT} ]] && SCRIPT='preseed.cfg'
+	Log.info "Getting '${URL}' ..."
+	wget -O ${TMPDIR}/${SCRIPT} "${URL}"
+}
+
+Man.addVar LXC_TEMPLATE 'The template to use for install. It might be a relative name (in which case lxc-create prepends \b/usr/share/lxc/templates/lxc-\b or an absolute path of an executable responsible for setting up the root file system of the new zone. (lxc specific)'
+[[ -z ${LXC_TEMPLATE} ]] && LXC_TEMPLATE='ubuntu-csmd'
+
+############################################################################
+# steps
+############################################################################
+Man.addFunc checkZonePathes '' '[+NAME?checkZonePathes - check zone path settings]
+[+DESCRIPTION?Checks, whether \bZBASE\b is set and points to a directory. Also sets \bZPATH\b to its default value \a$ZBASE/$ZNAME\a. If \bZFSNAME\b is set, it gets checked, whether it already exists. If not it gets created with the mountpoint set to \a$ZPATH\a, otherwise the function verifies, that the mountpoint is set to \a$ZPATH\a. If \bZFSNAME\b is not already set (the usual case), it gets deduced from \a$ZPATH\a if it already exists, otherwise from \a$ZBASE\a (NOTE that a leading "/" in it implies "dir" and not "zfs" operation mode. On error, this function logs a message and calls \bexit()\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZBASE ZNAME ZPATH ZFSNAME; }" '}
+[+SEE ALSO?\bdf\b(1)]
+'
+function checkZonePathes {
+	if [[ -z ${ZBASE} ]]; then
+		Log.fatal 'Zone base path ZBASE is not set.'
+		exit 3
+	fi
+	if [[ ! -d ${ZBASE} ]]; then
+		Log.fatal "Zone base path ${ZBASE} does not exist." \
+			'The following command might be used to create it:\n\t' \
+			'+ zfs create -o mountpoint=/zones -o compression=on rpool/zones'
+		exit 3
+	fi
+	# Need absolute canonical path
+	ZBASE=$( cd ${ZBASE} && print "${PWD}" )
+	[[ -z ${ZBASE} ]] && Log.fatal 'Unable to determine the absolute path of' \
+		"'${ZBASE}' (ZBASE)" && exit 3
+	ZPATH=${ZBASE}/${ZNAME}
+	
+	# On Linux it is dangerous - so lets manually check
+	if [[ -e ${ZBASE}/${ZNAME}/config ]]; then
+		Log.fatal "It appears, that ${ZBASE}/${ZNAME} is already prepared as" \
+			'a zone. Cleanup the directory and try again.'
+		exit 3
+	fi
+
+	typeset -a LIST
+	typeset X Y L
+	if [[ -n ${ZFSNAME} ]]; then
+		if [[ ${ZFSNAME:0:1} == '/' ]]; then
+			Log.fatal "Invalid ZFSNAME '${ZFSNAME}'"
+			exit 3
+		fi
+		if (( USE_ZFS )); then
+			LIST=( ${ zfs list -H -o name,mountpoint ${ZFSNAME} 2>/dev/null ; } )
+			if [[ -z ${LIST[0]} ]]; then
+				zfs create -o mountpoint=${ZPATH} ${ZFSNAME} || exit 3
+				Log.info "Using ZFS ${ZFSNAME} ..."
+				return
+			fi
+			if [[ ${LIST[1]} != ${ZPATH} ]]; then
+				# too hot to just reset it
+				Log.fatal "ZFS ${ZFSNAME} exists but its mountpoint is != ${ZPATH}"
+				exit 3
+			fi
+			Log.info "Using ZFS ${ZFSNAME} ..."
+		else
+			if [[ ! -d ${ZPATH} ]]; then
+				mkdir -p ${ZPATH}  || exit 3
+			fi
+			if [[ ${ZPATH} != /${ZFSNAME} ]]; then
+				if [[ ! -d /${ZFSNAME} ]]; then
+					mkdir -p /${ZFSNAME} || exit 3
+				fi
+				mount --rbind /${ZFSNAME} ${ZPATH} || exit 3
+				# rewrite the fstab
+				Y='' L="/${ZFSNAME}\t${ZPATH}\tnone\trbind\t0 2"
+				while read X ; do
+					LIST=( $X )
+					[[ ${L[0]} == /${ZFSNAME} ]] && X="$L" && L=''
+					Y+="$X\n"
+				done </etc/fstab
+				[[ -n $L ]] && Y+="$L\n"
+				print "$Y" >/etc/fstab
+			fi
+		fi
+		return
+	fi
+	
+	if (( ! USE_ZFS )); then
+		cd ${ZBASE}
+		X=( ${ df -h . 2>/dev/null | tail -1 ; } )
+		ZFSNAME=${X[0]}
+		[[ -z ${ZFSNAME} || ${ZFSNAME:0:1} != '/' ]] && ZFSNAME=${ZBASE}
+		ZFSNAME+="/${ZNAME}"
+		return
+	fi
+
+	LIST=( ${ zfs list -H -o name,mountpoint ${ZPATH} 2>/dev/null ; } )
+	ZFSNAME=${LIST[0]}
+	if [[ -n ${ZFSNAME} ]]; then
+		if [[ ${LIST[1]} == ${ZPATH} ]]; then
+			Log.info "Using existing ZFS ${ZFSNAME} ..."
+			return
+		fi
+		# may be a relict (mountpoint) from a previous zfs
+		rmdir ${ZPATH} || \
+			{ Log.fatal "${ZPATH} is not a separate ZFS." ; exit 3 ; }
+	fi
+
+	# created on demand, but than $ZBASE should be a separate ZFS
+	LIST=( ${ zfs list -H -o name,mountpoint ${ZBASE} 2>/dev/null ; } )
+	ZFSNAME=${LIST[0]}
+	if [[ -z ${ZFSNAME} ]]; then
+		Log.fatal "Unable to determine the name of the ZFS ${ZBASE}."
+		exit 3
+	fi
+	if [[ ${LIST[1]} != ${ZBASE} ]]; then
+		Log.fatal "${ZBASE} (ZBASE) should be a separate ZFS." \
+			'The following command might be used to create it:\n\t' \
+			"+ zfs create -o mountpoint=${ZBASE} -o compression=on rpool/zones"
+			exit 3
+	fi
+	ZFSNAME+="/${ZNAME}"
+	Log.info "Using ZFS ${ZFSNAME} ..."
+}
+
+Man.addVar TMPDIR 'Directory where temporary files like manifests and profiles should be stored. See also \bcreateTempdir()\b.'
+
+Man.addVar USEFIXTMP 'If != 0 \a/tmp/$ZNAME\a will be used as directory for storing temporary files and files used to finally create the zone. Also the directory will not be removed when the script terminates. Otherwise the result of \bmktemp\b(1) will be used instead. Default: \b0\b.'
+integer USEFIXTMP=0
+
+Man.addFunc createTempdir '' '[+NAME?createTempdir - prepare a directory for temporary files]
+[+DESCRIPTION?Creates a directory to store temporary files like manifests, profiles and misc. snippets. \bTMPDIR\b gets set to this directory. If the directory already exists it gets removed completely first. If the directory can not be created or removed, this function logs a message and calls \bexit()\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage USEFIXTMP TMPDIR; }" '}
+[+SEE ALSO?\brm\b(1), \bmktemp\b(1), \bcleanup()\b]
+'
+function createTempdir {
+	if (( USEFIXTMP )); then
+		TMPDIR=/tmp/${ZNAME}.tmp ; rm -rf $TMPDIR || exit 1 ; mkdir $TMPDIR
+		if (( $? != 0 )); then
+			Log.fatal 'Unable to create temp directory.'
+			exit 2
+		fi
+		return
+	fi
+	TMPDIR=${ mktemp -d /tmp/$ZNAME.XXXXXX ; }
+	if [[ -z ${TMPDIR} ]]; then
+		Log.fatal 'Unable to create temp directory.'
+		exit 2
+	fi
+}
+
+Man.addFunc cleanup '' '[+NAME?cleanup - cleanup temporary files and directories]
+[+DESCRIPTION?Removes the directory \a$TMPDIR\a unless \aUSEFIXTMP\a != 0 or \a$TMPDIR\a is not a sub directory of \b/tmp/\b. Per default it gets automatically called on script termination.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage USEFIXTMP TMPDIR; }" '}
+[+SEE ALSO?\brm\b(1), \bcreateTempdir()\b]
+'
+function cleanup {
+	# we do that for /tmp sub dirs, only
+	[[ -z ${TMPDIR} || ! -d ${TMPDIR} ]] && return
+	(( ! USEFIXTMP )) && [[ -n ${TMPDIR} && ${TMPDIR:0:5} == '/tmp/' ]] && \
+		rm -rf "${TMPDIR}" && return
+	Log.warn "The directory ${TMPDIR} still exists. Please delete it manually!"
+}
+
+function rootInfo {
+	integer I=${ id -u ; }
+	(( I )) && \
+		Log.warn 'You need root priviliges. Results may not what you expect.'
+}
+
+Man.addVar PKG_I '' 'Packages, which should be installed during the container setup as well. One should not use this variable directly. Use the function \baddPkg\b and \brmPkg\b instead (lxc specific).'
+typeset -A PKG_I
+
+Man.addVar PKG_U '' 'Packages, which should be uninstalled immediately after all additional packages have been added to the container. One should not use this variable directly. Use the function \baddPkg\b and \brmPkg\b instead (lxc specific).'
+typeset -A PKG_U
+
+Man.addFunc addPkg '' '[+NAME?addPkg - add the named package(s) to an [un]]install target]
+[+DESCRIPTION?Adds the named packages to the related list of template parameters, so that they get [un]]installed on the container automagically. The first operand sets the target section.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage PKG_I PKG_U ; }" '}
+\n\n{\binstall\b|\buninstall\b} \apkg_name\a ...
+'
+function addPkg {
+	typeset SACTION=$1 X
+	shift 1
+	if [[ ${SACTION} == 'install' ]]; then
+		X='PKG_I'
+	elif [[ ${SACTION} == 'uninstall' ]]; then
+		X='PKG_U'
+	else
+		Log.fatal "Unknown action '${SACTION}' - use '[un]install' instead."
+		exit 1
+	fi
+	typeset -n PKG=$X
+	for X in "$@" ; do
+		PKG[$X]=1
+	done
+}
+
+Man.addFunc rmPkg '' '[+NAME?rmPkg - remove the named package(s) from an [un]]install target]]
+[+DESCRIPTION?Removes the named packages to the related list of template parameters, so that they \bnot\b get [un]]installed on the container automagically. The first operand sets the target section.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage PKG_I PKG_U ; }" '}
+\n\n{\binstall\b|\buninstall\b} \apkg_name\a ...
+'
+function rmPkg {
+	typeset SACTION=$1 X
+	shift 1
+	if [[ ${SACTION} == 'install' ]]; then
+		X='PKG_I'
+	elif [[ ${SACTION} == 'uninstall' ]]; then
+		X='PKG_U'
+	else
+		Log.fatal "Unknown action '${SACTION}' - use '[un]install' instead."
+		exit 1
+	fi
+	typeset -n PKG=$X
+	for X in "$@" ; do
+		PKG[$X]=''
+	done
+}
+
+Man.addVar ZHNAME 'Hostname of the new zone. Default: \a$ZNAME\a'
+
+Man.addVar ZDOMAIN 'DNS domain to use within the zone. Default: If \a$ZHNAME\a c
+ontains a dot (.), everything after the first dot. Otherwise the domain name of 
+the global zone.'
+
+Man.addVar ZSEARCH 'The arguments for the search option to use for the zone its 
+\b/etc/resolv.conf\b. Default: Same as in the global zone, if not available \a$Z
+DOMAIN\a.'
+
+Man.addVar ZDNSRVR 'A comma separated list of DNS servers to use. Default: Same 
+as in the global zone. If the can not be determined \b127.0.0.1\b.'
+
+Man.addVar ZIP 'Primary IP address of the zone. Default: AUTO. See also "getent 
+hosts $ZNAME.$ZDOMAIN" or "getent hosts $ZNAME".'
+
+Man.addVar ZNMASK 'Netmask of the primary IP address of the zone. Format: "a.b.c
+.d" or "/N" (CIDR notation). Default: AUTO. See also "getent netmasks $ZIP".'
+
+Man.addVar ZDEFROUT 'If set, the IP of the default router to use. Default: Same as the one for the global zone. If empty, no default router will be set.'
+
+Man.addFunc checkIP '' '[+NAME?checkIP - check and set missing IP/DNS related settings for the zone.]
+[+DESCRIPTION?Function to check network parameters of the primary VNIC and DNS settings of the zone to install. If a required environment variable is not yet set, the corresponding settings of the current zone will be used to populate them.]
+[+?If the default router for the zone is different from the default router in this zone, \bZDEFROUT\b should be set explicitly. This is important because if it is empty or has an invalid value (network unreachable), SMF switches immediately and permanent over to dynamic routing (see \bin.routed\b(1M)) when the system gets initialized. One may use \brouteadm\b(1M) to determine the current routing typ  ("IPv4 routing: disabled" means static routing).]
+[+?Note that dynamic routing on the next [re]]boot gets also enabled permanently, if there is no valid \b/etc/defaultrouter\b or network strategy is set to \bdhcp\b.]
+[+?If an error occurs, this function calls \bexit()\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME ZHNAME ZDOMAIN ZIP ZNMASK ZSEARCH ZDNSRVR ZDEFROUT; }" '}
+[+SEE ALSO?\bgetprop()\b, \bgetent\b(1M), \bgetNetmaskBits()\b, \bgetNetmaskBitsByIP()\b, \broute\b(1M), \bmatchIP()\b]
+'
+function checkIP {
+	typeset -a A
+	typeset X Y
+	integer I
+
+	ZHNAME=${ZHNAME:-$ZNAME}
+	typeset X=${ZHNAME#*.} BITS=""
+	if [[ $X != $ZHNAME ]]; then
+		[[ -n $ZDOMAIN && $ZDOMAIN != $X ]] && \
+			Log.warn "Replacing ZDOMAIN=$ZDOMAIN by $X because ZHNAME=$ZHNAME"
+		ZDOMAIN="$X"
+		ZHNAME=${ZHNAME%%.*}
+	elif [[ -z $ZDOMAIN ]]; then
+		X=${ uname -n ; }
+		A=( ${ getent hosts $X ; } )
+		ZDOMAIN=${A[1]#*.}
+		if [[ -z $ZDOMAIN ]]; then
+			A=( ${ grep ^search /etc/resolv.conf | sort ; } )
+			if (( ${#A[@]} > 1 )); then
+				ZDOMAIN="${A[1]}"
+				I=${#A[@]}
+				[[ -z ${ZSEARCH} ]] && ZSEARCH="${A[1..I]}"
+			else
+				A=( ${ grep ^domain /etc/resolv.conf ; } )
+				ZDOMAIN="${A[1]}"
+			fi
+		fi
+		# [[ -z $ZDOMAIN ]] && ZDOMAIN="$FBZDOMAIN"
+	fi
+	ZDOMAIN=${ZDOMAIN%%.}
+	if [[ -z $ZIP ]]; then
+		ZIP=${ getent hosts ${ZHNAME}.$ZDOMAIN; }
+		[[ -z $ZIP ]] && ZIP=${ getent hosts $ZHNAME; }
+		if [[ -n $ZIP ]]; then
+			# last try
+			X=${ZIP#*[[:space:]]}
+			X=${X%%[[:space:]]*}
+			[[ -n $X ]] && ZDOMAIN=${X#*.}
+		fi
+		ZIP=${ZIP%%[[:space:]]*}
+	fi
+	if [[ -z $ZIP ]]; then
+		Log.fatal 'Unable to determine the primary IP address for the zone.' \
+			'Either set ZIP explicitly to the desired IP or add an' \
+			"appropriate host entry to /etc/inet/hosts for ${ZHNAME}.$ZDOMAIN ."
+		exit 2
+	fi
+	[[ $ZIP == "127.0.0.1" ]] && \
+		Log.warn "VNIC $ZVNIC will not get configured because the IP address" \
+			'127.0.0.1 is reserved for the loopback interface lo0.'
+	if [[ -z $ZNMASK ]]; then
+		ZNMASK=$(getent netmasks $ZIP)	
+		if [[ -z $ZNMASK ]]; then
+			BITS=$(getNetmaskBitsByIP $ZIP)
+			[[ -n $BITS ]] && ZNMASK="/$BITS"
+		else
+			ZNMASK=${ZNMASK##*[[:space:]]}
+		fi
+	fi
+	if [[ -z $ZNMASK ]]; then
+		Log.fatal "Unable to determine the netmask for ${ZIP}. Either set" \
+			'ZNMASK explicitly or add an entry to /etc/inet/netmasks or your' \
+			'name service.'
+		exit 2
+	fi
+	BITS=${ getNetmaskBits $ZNMASK; }
+	if [[ -z $BITS ]]; then
+		Log.fatal "Invalid netmask (ZNMASK=$ZNMASK). Format /N or N.N.N.N"
+		exit 2
+	fi
+	ZNMASK="/$BITS"
+	if [[ -z $ZSEARCH ]]; then
+		typeset -A ALL
+		while read X Y ; do
+			[[ $X == 'search' ]] || continue
+			for Z in $Y ; do
+				ALL[$Z]=1
+			done
+		done </etc/resolv.conf
+		ZSEARCH="${ZDOMAIN}"
+		for X in ${!ALL[@]} ; do
+			[[ $X == $ZDOMAIN ]] || ZSEARCH+=" $X"
+		done
+	fi
+	if [[ -z $ZDNSRVR ]]; then
+		unset ALL ; typeset -A ALL
+		while read X Y ; do
+			[[ $X == 'nameserver' ]] || continue
+			for  Z in $Y ; do
+				ALL[$Z]=1
+			done
+		done </etc/resolv.conf
+		ZDNSRVR="${!ALL[@]}"
+	fi
+	if [[ -z $ZDEFROUT ]]; then
+		A=( ${ ip route list root default ; } )
+		(( ${#A[@]} < 3 )) && ZDEFROUT="127.0.0.1" || ZDEFROUT="${A[2]}"
+	fi
+	if [[ -z ${MAC} && -n ${ZIP} ]]; then
+		A=( ${ZIP//./ } )
+		MAC="${MAC_PREFIX:-00:00:01}"
+		MAC+=${ printf ":%02x:%02x" ${A[2]} ${A[3]} ; }
+		I=${ ls -1d ${ZBASE}/*/config 2>/dev/null | wc -l ; }
+		(( I )) && (( I*=16 )) || I=16
+		MAC+=${ printf ':%02x' $I ; }
+	fi
+}
+
+Man.addVar ZVNIC 'Primary VNIC to use for the zone. Convention: \a$ZNAME\a\b0\b.'
+
+Man.addVar ZHOSTID 'HostId of the zone. Default: Last 4 bytes of the MAC address of $ZVNIC. (optional)'
+
+Man.addFunc checkNIC '' '[+NAME?checkNIC - check primary VNIC settings.]
+[+DESCRIPTION?Checks the Virtual Network Interface Card (VNIC) settings of the primary VNIC (\a$ZVNIC\a) to use for the non-global zone. If \aZVNIC\a is not yet set, it gets set to \a${ZNAME}0\a or \a${ZNAME}_0\a if $ZNAME ends with a digit (convention). Finally, if \a$ZHOSTID\a is not yet set, it gets set to the sum of the last 4 bytes of the MAC address of \a$ZVNIC\a. If an error occurs, this function calls \bexit()\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZVNIC ZNAME ZHOSTID MAC DEFAULTIF; }" '
+[+SEE ALSO?\bgetDefaultIfAndMac()\b, \bdladm\b(1M)]
+'
+function checkNIC {
+	typeset X
+	if [[ -z ${ZVNIC} ]]; then
+		ZVNIC="${ZNAME}"
+		[[ ${ZNAME} =~ [[:digit:]]$ ]] && ZVNIC+='_0' || ZVNIC+='0'
+	fi
+	if [[ -z ${ZHOSTID} ]]; then
+		getDefaultIfAndMac
+		typeset DIGIT=( ${MAC//:/ } )
+		ZHOSTID=""
+        for ((i=2; i <= 5; i++)); do
+			[[ ${#DIGIT[$i]} == 1 ]] && ZHOSTID+="0"
+			ZHOSTID+=${DIGIT[$i]}
+		done
+	fi
+}
+
+Man.addFunc prepareManifest '' '[+NAME?prepareManifest - creates the manifest to use for zone setup]
+[+DESCRIPTION?In contrast to Solaris LXC does not use a manifest for zone installs. So this function does nothing but returns 0.]
+'
+function prepareManifest {
+	return 0
+}
+
+Man.addFunc prepareProfiles '' '[+NAME?prepareProfiles - creates the profile to use for zone services setup]
+[+DESCRIPTION?In contrast to Solaris LXC does not use a profile for zone service configuration. So this function does nothing but returns 0.]
+'
+function prepareProfiles {
+	return 0
+}
+
+Man.addVar ZCMD 'Basename of the initial zone config file, which gets finally used to setup the zone. (read-only)'
+typeset -r ZCMD='zone.cmd'
+Man.addVar ZFSTAB 'Temporary basename of the fstab fragment file, which should be used by lxc-start to plumb other GZ filesystems/directories != rootfs into the zone before it gets actually started. (read-only)'
+typeset -r ZFSTAB='zone.fstab.extern'
+
+Man.addFunc createZoneConfig '' '[+NAME?createZoneConfig - Create a common zone config file]
+[+DESCRIPTION?Create the zone config file \a$ZCMD\a in \a$TMPDIR\a will be used in \binstallZone()\b to setup the new zone. Additional adjustments to the zone configuration can still be made by modifying this file properly.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZHOSTID ZPRIVS ZNAME ZPATH ZVNIC DATADIR TMPDIR ZCMD; }" '}
+[+SEE ALSO?\binstallZone()\b, \blxc-create\b(1), \baddDataDirs2zone()\b]
+'
+function createZoneConfig {
+	typeset X FSTAB INTFS
+	if [[ -f /etc/lxc/default.conf ]]; then
+		grep -v ^lxc.network.hwaddr /etc/lxc/default.conf >${TMPDIR}/${ZCMD}
+	else
+		cp /dev/null ${TMPDIR}/${ZCMD}
+	fi
+	[[ -n ${MAC} ]] && print "lxc.network.hwaddr = ${MAC}" >>${TMPDIR}/${ZCMD}
+	if (( USE_ZFS )); then
+		# lxc-create expect it to be set.
+		if [[ -n ${ZFSNAME} ]]; then
+			print "lxc.bdev.zfs.root = ${ZFSNAME}" >>${TMPDIR}/${ZCMD}
+		else
+			Log.fatal 'ZFSNAME is not set. Did you call checkZonePathes()?'
+			exit 3
+		fi
+	fi
+
+	addDataDirs2zone FSTAB INTFS
+	if [[ -n ${FSTAB} ]]; then
+		# GZ -> NGZ mounts
+		print -n "${FSTAB}" >${TMPDIR}/${ZFSTAB}
+		print "lxc.mount = ${TMPDIR}/${ZFSTAB}" >>${TMPDIR}/${ZCMD}
+	fi
+	if [[ -n ${INTFS} ]]; then
+		# NGZ internal (i.e. NGZ -> NGZ) mounts aka mappings
+		FSTAB=''
+		print "${INTFS}" | while read X ; do
+			[[ -z $X || ${X:0:1} == '#' ]] && continue
+			FSTAB+="lxc.mount.entry = $X\n"
+		done
+		print -n "${FSTAB}" >>${TMPDIR}/${ZCMD}
+	fi
+
+	Log.info "Configure zone using ${TMPDIR}/${ZCMD} ..."
+}
+
+
+Man.addFunc installZone '' '[+NAME?installZone - install the lxc zone]
+[+DESCRIPTION?It calls \blxc-create\b(1M) to install the zone using the current settings. If install fails, this function calls \bexit()\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage TMPDIR ZNAME; }" '}
+[+SEE ALSO?\bxsltproc\b(1), \bzoneadm\b(1M), \bcreateZoneConfig()\b, \bprepareProfiles()\b, \bprepareManifest()\b]
+'
+function installZone {
+	rootInfo
+	typeset X KEY PKGS
+	if [[ -d ${ZPATH}/rootfs ]]; then
+		Log.fatal "${ZNAME} seems to be there already - ${ZPATH}/rootfs exists"
+		exit 1
+	fi
+	typeset -a A=( '-n' "${ZNAME}" '-B' )
+	(( USE_ZFS )) && A+=( 'zfs' ) || A+=( 'dir' )
+	[[ -n ${ZBASE} ]] && A+=( '-P' "${ZBASE}" )
+	[[ -n ${LXC_TEMPLATE} ]] && A+=( '-t' "${LXC_TEMPLATE}" )
+	[[ -s ${TMPDIR}/${ZCMD} ]] && A+=( '-f' "${TMPDIR}/${ZCMD}" )
+	
+	A+=( '--' '-k')
+	[[ -n ${MAC_PREFIX} ]] && A+=( '-A' "${MAC_PREFIX}" )
+	(( FLUSH )) && A+=( '-f' )
+
+	# add packages to add/remove
+	for  X in ${!PKG_I[@]} ; do
+		[[ -n ${PKG_I[$X]} ]] && PKGS+=",$X"
+	done
+	[[ -n ${PKGS} ]] && A+=( '-i' "${PKGS:1}" )
+	PKGS=''
+	for  X in ${!PKG_U[@]} ; do
+		[[ -n ${PKG_U[$X]} ]] && PKGS+=",$X"
+	done
+	[[ -n ${PKGS} ]] && A+=( '-I' "${PKGS:1}" )
+	
+	lxc-create "${A[@]}" || return $?
+}
+
+Man.addFunc customizeZone '' '[+NAME?customizeZone - customize the new zone image]
+[+DESCRIPTION?Applies our local customization to the zone image, i.e. it assumes, that the zone is not already running. (lxc specific)]
+'
+function customizeZone {
+	Log.info 'Fetching post-install script ...'
+	if fetchPost post.sh "post&hname=${ZHNAME}.${ZDOMAIN}"; then
+		chmod 755 ${TMPDIR}/post.sh
+		Log.info 'Running post-install script ...'
+		${TMPDIR}/post.sh ${ZBASE}/${ZNAME}
+	fi
+	Log.info 'Done.'
+}
+
+Man.addFunc bootZone '' '[+NAME?bootZone - boot the zone and wait until it is running]
+[+DESCRIPTION?Boot the zone \a$ZNAME\a and wait until it is running. Unlike on Solaris right now there is no way to specify "wait until service xy is up" - systemd/upstart/init.d - all a pain in the ass.]
+[+?If booting the zone fails, this function exits with 1.]
+[t:timeout?Number of seconds to wait for the zone to come up (Default: 60). If the zone is not running after the timeout, the function exits with 2 and usually causes the script to terminate.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME; }" '}
+[+SEE ALSO?\blxc-start\b(1), \blxc-wait\b(1)]
+'
+function bootZone {
+	integer TIMEOUT=60 IDX
+	typeset STATE='' X
+	while getopts -a 'bootZone' "${ print ${Man.FUNC['bootZone']}; }" X ; do
+		case $X in
+			t) TIMEOUT=$OPTARG ; (( TIMEOUT < 1 )) && TIMEOUT=60 ;;
+		esac
+	done
+	X=$(( OPTIND - 1 ))
+	shift $X
+
+	Log.info "Booting zone ${ZNAME} ..."
+	lxc-start -n ${ZNAME} -P ${ZBASE} || return 1
+	if ! lxc-wait -n ${ZNAME} -P ${ZBASE} -s RUNNING -t 60; then
+		Log.fatal "'${ZNAME}' didn't come up within 2 minutes ..."
+		return 2
+	fi
+	Log.info 'Done.'
+}
+
+Man.addFunc destroyZone '' '[+NAME?destroyZone - halt, uninstall the zone and delete its configuration.]
+[+DESCRIPTION?This function halts a zone (if running), uninstalls it and finally deletes its zone configuration.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME LIBNAME SCRIPT; }" '}
+[+SEE ALSO?\bzoneadm\b(1M), \bzonecfg\b(1M)]
+'
+function destroyZone {
+	[[ -z ${ZNAME} || ${LIBNAME} == ${SCRIPT} ]] && exit 0
+	typeset -a A
+	
+	A=( ${ lxc-info -s -n ${ZNAME} -P ${ZBASE} ; } )
+	[[ -z $A ]] && return 0
+	if [[ ${A[1]} != 'STOPPED' ]]; then
+		Log.info "Stopping ${ZNAME} ..."
+		lxc-stop -n ${ZNAME} -P ${ZBASE} || return 1
+		if lxc-wait -s STOPPED -t 60 -n ${ZNAME} -P ${ZBASE} ; then
+			Log.info 'Done.'
+		else
+			Log.fatal "Zone ${ZNAME} is still running - givin up."
+			return 2
+		fi
+	fi
+	if lxc-destroy -n ${ZNAME} -P ${ZBASE} ; then
+		Log.info "${ZNAME} destroyed"
+	else
+		[[ -d ${ZNAME}/${ZBASE}/rootfs ]] && \
+			Log.info "${ZNAME} still exists." && return 3
+	fi
+	return 0
+}
+
+Man.addFunc zlogin '' '[+NAME?zlogin - convinience function for lxc-attach]
+[+DESCRIPTION?Convinience function to avoid boilerplate code and align with its Solaris analogon (lxc specific). Just runs:]
+[+? "lxc-attach -n $1 -P ${ZBASE} --clear-env -- $2..$n"]
+\n\n\azone_name\a [\acommand\a [\aarg\a...]]'
+function zlogin {
+	typeset ZONE=$1
+	[[ -z $ZONE ]] && return 0
+	shift
+	lxc-attach -n ${ZONE} -P ${ZBASE} --clear-env -- "$@"
+}
+
+function showUsage {
+    if [[ $2 != LIBX ]]; then
+        getopts -a "$1" "${ print ${Man.FUNC[$2]}; }" OPT --man
+    else
+        typeset XX='
+[+?The purpose of this library is to be able to setup adhoc and in a flexible manner non-global zones following common policies/guide lines (schema "F").]
+[+?Here, schema "F" means basically "reproducable at any time" as well as that per default:]{
+    [+-?The zone setup script name is always \a$ZNAME-zonesetup.ksh\a, whereby \a$ZNAME\a denotes the name of the zone and its hostname as well.]
+    [+-?The virtual network interfaces (VNIC) used by the zone have always the name of the zone suffixed by an instance number (0..N).]
+    [+-?An exclusive-IP stack is used.]
+    [+-?The admin home of the zone is always \b/local/home/admin\b and accessed directly instead of using an autofs mounted /home/admin to avoid NFS problems early (machine appears to hang).]
+    [+?-One gets the same working  and fully functional zone by executing the corresponding script and mounting of relevant ZFS on another machine within minutes.]
+}
+'
+        typeset X="${ print ${Man.FUNC[LIB]}; }" OPT
+        X=${X%\[h:*\]*} # remove OPTIONS and other trailing stuff
+        getopts -a "$1" "${ print ${X}${XX}; }" OPT --man
+    fi
+}
+
+# shared options
+X='[h:help?Print this help and exit.]
+[l:list?Print a list of script relevant environment variables, their current value and exit.]
+[f:functions?Print the source of all functions currently defined and exit. Just invokes \btypeset -f\b builtin.]
+[F:fnames?Print a list of all functions currently defined and exit. Just invokes \btypeset +f\b builtin.]
+[H:usage]:[functionName?Show the usage info for the given function, if available and exit. See also option \a-F\a.]
+[L:libusage?Print the library usage information and exit.]
+[D:libdesc?Print an extended description of the '"${LIBNAME##*/}"' library and exit.]
+[s:script?Print a script for the setup of a standard zone and exit.]
+[S:Script?Print a script with comments for the setup of a standard zone and exit.]
+[T:trace]:[fname_list?a comma or whitespace separated list of names of functions to trace. Should be specified as the first switch to be able to trace anything. See also option \b-F\b .] 
+'
+
+ACTION=${ZNAME:-$'$ZNAME'}
+Man.addFunc MAIN '' '[+NAME?'"${SCRIPT##*/}"' - setup/destroy the zone \b'"${ACTION}"'\b .]
+[+DESCRIPTION?Script to setup or destroy the zone \b'"${ACTION}"'\b . The name of the zone ($ZNAME) is automatically deduced from this script name if not already set. For more information use option \b-L\b .]
+[i:install?Install the non-global zone '"${ACTION}"'.]
+[n:new?Create a new miniroot image (throw away the old/cached one) before installing the new zone.]
+[u:uninstall?Destroy and uninstall the non-global zone '"${ACTION}"'.]
+'"$X"
+
+Man.addFunc LIB '' '[+NAME?'"${LIBNAME##*/}"' - library which makes it easy to create scripts for zone setup/destroy easily.]
+[+DESCRIPTION?This ksh93 script contains several functions, which makes it much easier to create scripts for zone setup and destruction. When it get sourced in, it tries to determine the full path of the running script (see \a$SCRIPT\a), sets the environment variable \bSDIR\b (if not already set) to the directory, which contains the running script, sets the environment variable \aLIBNAME\a to the full path of this library script, changes automatically the current working directory (CWD) to \a$SDIR\a and finally initializes all required variables. So before this script gets sourced from another script, one should not change the CWD or cd back to the original CWD before the library gets sourced. Otherwise the described mechanismen may not work as expected.]
+'"$X"'[+ENVIRONMENT VARIABLES?The following variables are used within the library and might be used in the '"${SCRIPT##*/}"':]{' "${Man.VAR[*]}" '}
+'
+ACTION=""
+X=MAIN
+[[ ${SCRIPT} == ${LIBNAME} ]] && X=LIB
+
+while getopts "${ print ${Man.FUNC[$X]}; }" option ; do
+    case "$option" in
+        h) showUsage "${SCRIPT##*/}" $X ; exit 0 ;;
+		L) showUsage "${LIBNAME##*/}" LIB ; exit 0 ;;
+        s) skeleton ; exit 0 ;;
+		S) skeleton -x ; exit 0 ;;
+		H)
+			if [[ ${OPTARG%_t} != $OPTARG ]]; then
+				$OPTARG --man						# self-defined types
+			else
+				showUsage "$OPTARG" "$OPTARG"		# functions
+			fi
+			exit 0
+			;;
+		T)	if [[ ${OPTARG} == 'ALL' ]]; then
+				typeset -ft ${ typeset +f ; }
+			else
+				typeset -ft ${OPTARG//,/ }
+			fi
+			;;
+		f) typeset -f ; exit 1 ;;
+		F) typeset +f ; exit 1 ;;
+		D) showUsage "${LIBNAME##*/}" LIBX; exit 0 ;;
+		i) ACTION="INSTALL" ;;
+		u) destroyZone ; exit $? ;;
+		l) Man.listVars ; exit ;;
+		n) FLUSH=1 ;;
+    esac
+done
+X=$(( OPTIND - 1 ))
+shift $X
+
+# nothing to do ? Show help
+if [[ -z $ACTION || $ACTION == HELP ]]; then
+	[[ $LIBNAME == $ZNAME ]] && showUsage "${LIBNAME##*/}" LIB && exit 0
+	if [[ -n $ZNAME ]]; then
+		showUsage "${SCRIPT##*/}" MAIN
+		exit 0
+	fi
+fi
+[[ $LIBNAME == $SCRIPT ]] && exit 0
+[[ -z ${ZNAME} ]] && \
+	Log.warn "Unable to determine zone name automagically (ZNAME)!"
+
+trap cleanup EXIT 
+
+# vim: ts=4 sw=4 filetype=sh
