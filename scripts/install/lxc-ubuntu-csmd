@@ -1,0 +1,1476 @@
+#!/bin/ksh93 -e
+
+# Template script for generating ubuntu container for LXC.
+# Copy it to the GZ's /usr/share/lxc/templates/lxc-ubuntu-csmd to be able to
+# use just  lxc-create -t ubuntu-csmd  ...
+
+# This script consolidates and extends the existing lxc ubuntu scripts.
+# It tries to be as compatible as possible to the limited setup script coming
+# with LXC/Ubuntu#s LXC package. Incompatible differences are:
+
+# Since dumb pseudo intelligence is disliked, this script does not contain any
+# squid auto-detection brain damage/functions. Instead one can specify them
+# directly (if any) on the CLI using the -X and -x options or the env variables
+# http_proxy and https_proxy. Container specific, i.e. non-miniroot packages to
+# install can be specified using option -i instead of --packages. To flush the
+# cached [partial] miniroot, use -f instead of -F. If you want to debug one or
+# more parts (i.e. functions) of the script, use -T fname instead of -d. The
+# special fname 'ALL' can be used to enable debugging for all functions and thus
+# would be the alternative for -d. Last but not least this script avoids using
+# global vars and passing operands by value - usually the associative array
+# SOPTS is passed as reference (usually CFG) to most functions and can be used
+# to obtain/store script related settings.
+# Last but not least this template supports full plumbing of the rootfs BEFORE
+# installation starts (i.e. inherit datasets from the GZ, do zone internal
+# mounts) and of course the unplumbing on exit. For more information see $0 -h.
+
+# Copyright 2014 Jens Elkner <jel+lxc@cs.uni-magdeburg.de>
+# see $0 -h
+
+typeset -r VERSION='$Rev$'
+typeset -r FPROG="${.sh.file}"
+typeset -r PROG="${FPROG##*/}"
+
+export PATH="${PATH}:/usr/sbin:/usr/bin:/sbin:/bin" POSIXLY_CORRECT=1
+
+unset SOPT DEFAULT MIRROR SECURITY_MIRROR ; typeset -A SOPT DEFAULT
+
+# Miniroot packages, only. Any change here requires '-f' to reflect changes!
+# The previous/packaged ubuntu template honors packages_template env var :(
+# for whatever reason. So to be compatible ...
+A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
+X="${A[*]}"
+unset A
+
+DEFAULT=(
+	[release]='utopic'
+	[pkgs.t]=",${X// /,}"
+
+	[user]='admin'
+	[user.pw]='ubuntu'
+	[user.shell]='/usr/bin/tcsh'
+	[user.gcos]='Administrator'
+	# the real "physical" base directory for local homes. /home is usually an
+	# automounter maintained directory - keep it empty
+	[homebase]='/local/home'
+
+	# make sure, these locales are defined within the new container.
+	# space separated!
+	[locales]='en_US.UTF-8 de_DE.UTF-8'
+#	[langs]=',en'								# language-packs
+
+	[proxy]="${http_proxy:-none}"
+	[proxys]="${https_proxy:-none}"
+	[mirror.x86]='http://de.archive.ubuntu.com/ubuntu'
+	[mirrors.x86]='http://security.ubuntu.com/ubuntu'
+	[mirror.ports]='http://de.ports.ubuntu.com/ubuntu-ports'
+	[mirrors.ports]='http://de.ports.ubuntu.com/ubuntu-ports'
+
+	[statedir]='/var'
+	[templatecfg]='/usr/share/lxc/config'
+	[lock.timeout]=120							# in seconds
+	[mac.prefix]='00:16:3e'
+)
+DEFAULT[cache]="${DEFAULT[statedir]}/cache/lxc"
+
+# Yes, one may "hijack" DEFAULT[] and SOPTS[] here. For now, it's a feature ;-)
+[[ -r /etc/default/lxc ]] && . /etc/default/lxc
+# Backward compat:
+[[ -n ${MIRROR} ]] && DEFAULT[mirror.x86]="${MIRROR}" && unset MIRROR
+[[ -n ${MIRRORS} ]] && DEFAULT[mirrors.x86]="${MIRRORS}" && unset MIRRORS
+
+# to be able to distinguish this scripts messages from other output
+typeset -T LogObj_t=(
+	typeset -Sh 'Color for info messages' GREEN='38;5;232;48;5;118'
+	typeset -Sh 'Color for warning messages' BLUE='38;5;21;48;5;118'
+	typeset -Sh 'Color for fatal messages' RED='38;5;9;48;5;118'
+	function log {
+		print -u2 "\E[1;$2m${ date +%T; } $1:\E[0m $3"
+	}
+	typeset -Sfh ' log a message' log
+	function info {
+		_.log "INFO" ${_.GREEN} "$*"
+	}
+	typeset -Sfh ' log a info message' info
+	function warn {
+		_.log "WARN" ${_.BLUE} "$*"
+	}
+	typeset -Sfh ' log a warning message' warn
+	function fatal {
+		_.log "FATAL" ${_.RED} "$*"
+	}
+	typeset -Sfh ' log a fatal error message' fatal
+	function printMarker {
+		typeset COLOR="$1"
+		print -f '\E[1;%sm----------------------------------------------------------------------------\E[0m\n' "${COLOR:-${_.GREEN}}"
+	}
+	typeset -Sfh ' print a marker line' printMarker
+)
+LogObj_t Log
+
+function showUsage {
+    getopts -a ${PROG} "${ print ${USAGE}; }" OPT --man
+}
+
+function pressKey2continue {
+	typeset A
+	[[ ${SOPT[ftrace]} =~ @$1@ ]] || return 0
+	print "\E[1m$1 done. \E[38;5;9mHit <ENTER> to continue!\E[0m"
+	read A
+	return 0
+}
+
+# Check if given path is in a btrfs partition
+function is_btrfs {
+	[[ -e $1 && ${ stat -f -c '%T' "$1" ; } == 'btrfs' ]]
+}
+
+# Check if given path is the root of a btrfs subvolume
+function is_btrfs_subvolume {
+	[[ -d $1 && ${ stat -f -c '%T' "$1" ; } == 'btrfs' ]] && \
+		(( ${ stat -c '%i' "$1" ; } == 256  ))
+}
+
+function try_mksubvolume {
+	typeset P="$1"
+	[[ -d $P ]] && return 0
+
+	mkdir -p "${P%/*}" || return 1
+	if [[ -n ${SOPT[btrfs]} ]] && is_btrfs "${P%/*}" ; then
+		btrfs subvolume create "$P"
+	else
+		mkdir -p "$P"
+	fi
+}
+
+function try_rmsubvolume {
+	typeset P="$1"
+	[[ -d $P ]] || return 0
+	if [[ -n ${SOPT[btrfs]} ]] && is_btrfs_subvolume "$P" ; then
+		btrfs subvolume delete "$P"
+	else
+		rm -rf "$P"
+	fi
+}
+
+function umountPkgCache {
+	if [[ -n ${SOPT[cache.apt.pkg]} ]]; then
+		umount -f ${SOPT[cache.apt.pkg]} && SOPT[cache.apt.pkg]=''
+	fi
+	if [[ -n ${SOPT[cache.apt.lib]} ]]; then
+		umount -f ${SOPT[cache.apt.lib]} && SOPT[cache.apt.lib]=''
+	fi
+}
+
+function cleanup {
+	umountPkgCache
+	try_rmsubvolume ${SOPT[cache.partial]}
+	try_rmsubvolume ${SOPT[cache.rootfs]}
+	Log.printMarker
+	pressKey2continue ${.sh.fun}
+}
+
+function disable_svcs {
+	typeset X="$1/usr/sbin/policy-rc.d"
+	print '#!/bin/sh\n# return: action forbidden by policy\nexit 101' >"$X"
+	chmod 0755 "$X"
+	pressKey2continue ${.sh.fun}
+}
+
+function enable_svcs {
+	rm -f "$1/usr/sbin/policy-rc.d"
+	pressKey2continue ${.sh.fun}
+}
+
+function write_sourceslist {
+	typeset -n CFG=$1
+
+	typeset DIR="$2"	# path to the partial cache or the rootfs
+	typeset ARCH="$3"	# architecture we want to add
+	typeset MULTI="$4"	# whether to use the multi-arch syntax or not
+	typeset REPOS='main restricted universe multiverse' REL="${CFG[release]}"
+
+	[[ -z ${ARCH} ]] && ARCH="${CFG[arch]}"
+	[[ -n ${MULTI} ]] && MULTI="[arch=${ARCH}] "
+
+	if [[ -n ${CFG[proxy]} && ${CFG[proxy]} != 'none' ]]; then
+		mkdir -p "${DIR}/etc/apt/apt.conf.d"
+		print "Acquire::http::Proxy \"${CFG[proxy]}\" ;" \
+			>"${DIR}/etc/apt/apt.conf.d/70proxy"
+	fi
+	
+	cat >>"${DIR}/etc/apt/sources.list"<<EOF
+deb ${MULTI}${CFG[mirror]} ${REL} ${REPOS}
+deb ${MULTI}${CFG[mirror]} ${REL}-updates ${REPOS}
+deb ${MULTI}${CFG[mirrors]} ${REL}-security ${REPOS}
+EOF
+	pressKey2continue ${.sh.fun}
+}
+
+function download_ubuntu {
+	typeset -n CFG=$1
+	typeset X PKGS="${CFG[pkgs.t]:1}${CFG[langs]}" IPKGS UPKGS \
+		TMPROOT=${CFG[cache.partial]} PKGCACHE="${CFG[cache.apt]}"
+
+	for X in ${CFG[cache.rootfs]} ${PKGCACHE} ${TMPROOT} ; do
+		if ! try_mksubvolume $X ; then
+			Log.fatal "Unable to create directory '$X'!"
+			return 1
+		fi
+	done
+	[[ ! -d ${PKGCACHE}/cache ]] && mkdir ${PKGCACHE}/cache
+	[[ ! -d ${PKGCACHE}/lib ]] && mkdir ${PKGCACHE}/lib
+
+	# download a mini ubuntu into a cache
+	Log.info "Bootstrapping Ubuntu ${CFG[release]} miniroot (${PKGS}) ..."
+	
+	trap cleanup EXIT SIGHUP SIGINT SIGTERM
+	[[ ! -d ${TMPROOT}/var/lib/apt ]] && mkdir -p ${TMPROOT}/var/lib/apt
+	[[ ! -d ${TMPROOT}/var/cache/apt ]] && mkdir -p ${TMPROOT}/var/cache/apt
+
+	CFG[cache.apt.pkg]=''
+	CFG[cache.apt.lib]=''
+	if [[ -d ${TMPROOT}/var/lib/apt && -d ${TMPROOT}/var/cache/apt ]]; then
+		if mount --bind ${PKGCACHE}/cache ${TMPROOT}/var/cache/apt ; then
+			SOPT[cache.apt.pkg]="${TMPROOT}/var/cache/apt"
+			mount --bind ${PKGCACHE}/lib ${TMPROOT}/var/lib/apt && \
+				SOPT[cache.apt.lib]="${TMPROOT}/var/lib/apt"
+		fi
+	fi
+
+	for X in ${PKGS//,/ } ; do
+		[[ ${X:0:1} == '-' ]] && UPKGS+=" ${X:1} " || IPKGS+=",$X"
+	done
+	[[ -n ${CFG[ftrace]} && ${CFG[ftrace]} =~ @${.sh.fun}@ ]] && X='sh -x' || X=
+	$X ${CFG[bootstrap]} --verbose --components=main,universe \
+		--arch=${CFG[arch]} --include="${IPKGS:1}" \
+		${CFG[release]} ${TMPROOT} "${CFG[mirror]}"
+
+	if (( $? )); then
+		Log.fatal 'Failed to download the minimal package set, aborting.'
+		return 2
+	fi
+
+	# Serge isn't sure whether we should avoid doing this when getting the
+	# latest development release, i.e. ${CFG[release]} == ${ distro-info -d ; }
+	Log.info 'Installing miniroot updates ...'
+	> ${TMPROOT}/etc/apt/sources.list
+	write_sourceslist CFG ${TMPROOT}/
+
+	typeset -x LC_CTYPE=C LANGUAGE= LANG=
+	if ! chroot ${TMPROOT} apt-get update ; then
+		Log.fatal "Failed to update miniroot's apt cache."
+		return 3	# JEL-TBD: hmm, really?
+	fi
+
+	[[ ! -x /usr/sbin/root ]] && UPKGS=${UPKGS// sudo / } || \
+		typeset -x SUDO_FORCE_REMOVE=yes
+
+	chroot ${TMPROOT} apt-get purge -y ${UPKGS}
+
+	if [[ -x /usr/sbin/root && ! -e ${TMPROOT}/usr/sbin/root ]]; then
+		cp /usr/sbin/root ${TMPROOT}/usr/sbin/root
+		ln -s root ${TMPROOT}/usr/sbin/+
+		chmod 4555 ${TMPROOT}/usr/sbin/root
+		print "${CFG[user]}\t*,default:root" >${TMPROOT}/etc/root.conf
+		chmod 0600 ${TMPROOT}/etc/root.conf
+	fi
+	X=/usr/share/man/man1/root.1
+	if [[ -f $X && ! -e ${ZPATH}/$X ]]; then
+		cp -p $X ${TMPROOT}/$X
+		ln -s root.1 ${TMPROOT}/${X%/*}/+.1
+	fi
+
+	disable_svcs ${TMPROOT}
+	if ! lxc-unshare -s MOUNT -- chroot ${TMPROOT} apt-get dist-upgrade -y
+	then
+		Log.warn 'Miniroot upgrade failed.  The miniroot cache may be out' \
+			'of date, in which case flushing the cache (option -f) may help.'
+	fi
+	enable_svcs ${TMPROOT}
+
+	umountPkgCache
+	[[ ! -e  ${TMPROOT}/var/lib/apt/extended_states ]] && \
+		cp -a ${PKGCACHE}/lib/* ${TMPROOT}/var/lib/apt/
+
+	mv ${TMPROOT}/* ${CFG[cache.rootfs]}/
+
+	trap - EXIT SIGINT SIGTERM SIGHUP
+	Log.info 'Miniroot is complete and ready for use.'
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function create_miniroot {
+	typeset -n CFG=$1
+	typeset LOCK="${CFG[lockdir]}/ubuntu-${CFG[release]}"
+	typeset I K=$$ S X LC_NUMERIC=C
+
+	# no flock subshell bullshit - the simple way is sufficient
+	(( S=${CFG[lock.timeout]}/0.2 ))
+	for (( I=0; I < S; I++ )); do
+		if [[ -e ${LOCK} ]]; then
+			if (( I )); then
+				(( I%5 == 1 )) && print -n '.'
+			else
+				Log.warn 'Waiting for another pkg cache using process to' \
+					'finish ...'
+			fi
+			sleep 0.2
+			continue
+		fi
+		print $K >>${LOCK}
+		X=$(<${LOCK})
+		[[ $X == $K ]] && trap "rm -f ${LOCK}" EXIT && K=0 && break
+	done
+
+	if (( K )); then
+		Log.fatal 'Package cache is still busy - giving up.'
+		return 1
+	fi
+	(( I )) && print
+
+	if [[ -n ${CFG[cache.apt.clear]} ]]; then
+		Log.info 'Flushing package cache ...'
+		try_rmsubvolume ${CFG[cache.apt]} && CFG[cache.apt.clear]=''
+	fi
+	if [[ -n ${CFG[flush]} ]]; then
+		integer I=0
+		Log.info 'Flushing cached miniroot ...'
+		try_rmsubvolume ${CFG[cache.partial]} && (( I++ ))
+		try_rmsubvolume ${CFG[cache.rootfs]} && (( I++ ))
+		(( I == 2 )) && CFG[flush]=''
+	fi
+
+	if [[ ! -e ${CFG[cache.rootfs]}/bin/sh ]]; then
+		if ! download_ubuntu CFG ; then
+			Log.fatal 'Download failed.'
+			return 2
+		fi
+	fi
+
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function plumb_zonefs {
+	typeset -n CFG=$1
+	typeset RFS="${CFG[rootfs]}" E X
+
+	try_mksubvolume ${RFS} || return $?
+	CFG[mounts.ext]='' CFG[mounts.int]=''
+	if [[ -n ${CFG[fstab.ext]} ]]; then
+		while read LINE ; do
+			E=( ${LINE} )
+			[[ -z $E || ${E[0]:0:1} == '#' ]] && continue	
+			if [[ ! -d ${RFS}/${E[1]} ]]; then
+				mkdir -p ${RFS}/${E[1]} || return $?
+			fi
+			# we've already checked them in read_configuration
+			mount -o ${E[3]} "${E[0]}" "${RFS}/${E[1]}" || return $?
+			CFG[mounts.ext]+="${RFS}/${E[1]} "
+		done <${CFG[fstab.ext]}
+	fi
+	[[ -z ${CFG[fstab.int]} ]] && return 0
+	print "${CFG[fstab.int]}" | while read LINE ; do
+		E=( ${LINE} )
+		[[ -z $E || ${E[0]:0:1} == '#' ]] && continue	
+		if [[ ${E[2]} != 'tmpfs' ]]; then
+			X="${RFS}/${E[0]}"
+			if [[ ! -d ${RFS}/${E[0]} ]]; then
+				mkdir -p ${RFS}/${E[0]} || return $?
+			fi
+		else
+			X="${E[0]}"
+		fi
+		if [[ ! -d ${RFS}/${E[1]} ]]; then
+			mkdir -p ${RFS}/${E[1]} || return $?
+		fi
+		# we've already checked them in read_configuration
+		mount -o ${E[3]} $X "${RFS}/${E[1]}" || return $?
+		CFG[mounts.int]+="${RFS}/${E[1]} "
+	done
+	return 0
+}
+
+function unplumb_zonefs {
+	typeset -n CFG=$1
+	typeset A
+	integer K=0 I
+	if [[ -n ${CFG[mounts.int]} ]]; then
+		A=( ${CFG[mounts.int]} )
+		I=${#A[@]}
+		for (( I-=1; I >= 0; I-- )); do
+			umount -f "${A[I]}" || (( K++ ))
+		done
+	fi
+	if [[ -n ${CFG[mounts.ext]} ]]; then
+		A=( ${CFG[mounts.ext]} )
+		I=${#A[@]}
+		for (( I-=1; I >= 0; I-- )); do
+			umount -f "${A[I]}" || (( K++ ))
+		done
+	fi
+	return $K
+}
+
+function copy_miniroot2zone {
+	typeset -n CFG=$1
+	typeset ZFS="${CFG[cfgdir]}/rootfs" RFS="${CFG[rootfs]}" \
+		MINIROOT="${CFG[cache.rootfs]}" \
+
+	Log.info "Transfering miniroot '${MINIROOT}' to new container's '${RFS}'"
+	if [[ -n ${CFG[btrfs]} ]] && is_btrfs_subvolume ${MINIROOT} && \
+		is_btrfs_subvolume ${RFS}
+	then
+		[[ ${RFS} == ${ZFS} ]] || umount ${RFS} || return 1
+		btrfs subvolume delete ${ZFS} || return 1
+		btrfs subvolume snapshot ${MINIROOT} ${ZFS} || return 1
+		[[ ${RFS} == ${ZFS} ]] || mount --bind ${ZFS} ${RFS} || return 1
+	else
+		# Because there might be already some dirs dueto ext->int mounts, a
+		# simple mv might produce unwanted results.
+		rsync -Ha ${MINIROOT}/ ${RFS}/ || return 1
+		[[ -z ${CFG[keep.miniroot]} ]] && rm -rf ${MINIROOT}
+	fi
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function checkFstabEntry {
+	typeset -n MSG=$1
+	integer INTERNAL=$2 I
+	typeset X P E=( $3 ) F=( 'resource' 'point' )
+	MSG=''
+	P="${E[0]}"
+	[[ -z $P || ${P:0:1} == '#' ]] && return 0	# comment or empty lines are ok
+	if (( ${#E[@]} != 6 )); then
+		MSG='Mount entry is invalid - field count != 6'
+		return 1
+	fi
+	I=0
+	for P in ${E[0..1]}; do
+		X=${P//*([-_.a-zA-Z0-9\/])}	# extract invalid chars
+		if [[ -n $X ]]; then
+			MSG+="Mount ${F[I]} '$P' contains invalid characters '$X'.\n"
+		elif [[ ${P:0:1} =~ [-.] ]]; then
+			MSG+="Mount ${F[I]} '$P' starts with a dash or slash or dot "
+			MSG+='(not allowed).\n'
+		elif [[ $P =~ \.\. ]]; then
+			MSG+="Mount ${F[I]} '$P' contains '..' (not allowed).\n"
+		fi
+		if (( I > 0 )); then
+			if (( INTERNAL )); then
+				[[ ${P:0:1} == '/' ]] || \
+					MSG+="Mount point '$P' is not absolute.\n"
+			else
+				# makes life much easier
+				[[ ${P:0:1} == '/' ]] && \
+					MSG+="Absolut mount points not supported ($P).\n"
+			fi
+		fi
+		(( I++ ))
+	done
+	# for now we only support 'binds' and tmpfs, only. TBD: ZFS
+	[[ ${E[2]} != 'none' && ${E[2]} != 'tmpfs' ]] && \
+		MSG+="FS type '${E[2]}' is corrently not supported.\n"
+	[[ ${E[3]} =~ ^[-a-zA-Z0-9,.=]+$ ]] || \
+		MSG+="Mount option '${E[3]}' contains invalid characters.\n"
+	[[ ${E[4]} =~ ^[0-9]+$ ]] || \
+		MSG+="Dump field contains not a number (${E[4]}).\n"
+	[[ ${E[5]} =~ ^[0-9]+$ ]] || \
+		MSG+="Pass field contains not a number (${E[5]}).\n"
+	[[ -n ${MSG} ]] && return 2
+	return 0
+}
+
+function read_configuration {
+	typeset -n CFG=$1
+	typeset CONFIG="${CFG[cfgdir]}/config" RCFG='' NETCFG='' AUTOCFG='' X LINE \
+		KEY VAL FSTAB=''
+	integer I=0 K=0 M=0
+
+	CFG[rootfs.seen]='' CFG[rootfs.options.seen]=''
+	while read LINE ; do
+		[[ ${LINE:0:4} != 'lxc.' ]] && RCFG+="${LINE}\n" && continue
+		# normalize, so that '=' is surrounded by exactly one space char, only 
+		X="${LINE/#~(E)([[:space:]]*)=([[:space:]]*)/ = }"
+
+		if [[ ${X:4:8} == 'network.' ]]; then
+			LINE="$X"
+			X=${X:12}
+			VAL=${X#*= }
+			KEY=${.sh.match% = }
+			# add to config just in case
+			CFG[network.${KEY}]="${VAL}"
+			if [[ ${KEY} == 'type' && ${VAL} =~ ^(veth|macvlan)$ ]]; then
+				[[ ${VAL} == 'veth' ]] && (( I++ )) || (( M++ ))
+			elif [[ ${KEY} == 'hwaddr' ]]; then
+				(( K++ ))
+			elif [[ ${KEY} =~ ^ipv(4|6)(\.|$) ]]; then
+				NETCFG+='# Disabled: may cause ~ 2 min startup delay!\n'
+				NETCFG+='# Configure from inside: /etc/network/interfaces\n#'
+			fi
+			NETCFG+="${LINE}\n"
+		else
+			if [[ ${X:4:8} == 'rootfs =' ]]; then
+				CFG[rootfs.seen]=1
+			elif [[ ${X:4:16} == 'rootfs.options =' ]]; then
+				CFG[rootfs.opts.seen]=1
+			elif [[ ${X:4:7} == 'mount =' ]]; then
+				[[ -r ${X:12} ]] && CFG[fstab.ext]="${X:12}"
+				continue
+			elif [[ ${X:4:13} == 'mount.entry =' ]]; then
+				FSTAB+="${X:18}\n" && continue
+			fi
+			AUTOCFG+="$X\n"
+		fi
+	done <${CONFIG}
+	
+	if (( K == 0 && I+M == 1 )); then
+		# If there is exactly one veth|macvlan network entry, make sure it has
+		# an associated hwaddr. To get something stable, we try to deduce it
+		# from the host's IP and number of configured zones and fallback to
+		# simple random bytes if required info's are n/a.
+		I=0
+		X=''
+		if [[ -n ${CFG[mac.prefix]} ]]; then
+			VAL=( ${CFG[mac.prefix]//:/ } )
+			S=${#VAL[@]}
+			(( S > 5 )) && S=5
+			for (( I=0 ; I < S; I++ )); do
+				[[ ${VAL[I]} =~ ^[0-9a-fA-F][0-9a-fA-F]?$ ]] || break
+				X+=":${VAL[I]}"
+			done
+		fi
+		if [[ -z $X ]]; then
+			X=':00:16:3e'
+			I=3
+		fi
+		KEY=${ hostname ; }
+		VAL=( ${ getent hosts ${KEY} ; } )
+		if (( ${#VAL[@]} < 2 )); then
+			for (( ; I < 5; I++ )) ; do
+				X+=${ printf ':%02x' ${RANDOM} ; }
+			done
+		else
+			VAL=( ${VAL[0]//./ } )
+			for (( ; I < 5 ; I++ )); do
+				X+=${ printf ':%02x' ${VAL[I-1]} ; }
+			done
+		fi
+		K=${ ls -1d ${CFG[cfgdir]%/*}/*/config 2>/dev/null | wc -l ; }
+		if (( ! K )); then
+			K=16
+		elif (( K < 16 )); then
+			(( K*=16 ))
+		elif (( K < 32 )); then
+			(( K*=8 ))
+		elif (( K < 64 )); then
+			(( K*=4 ))
+		else
+			K=0
+		fi
+		(( K )) && X+=${ printf ':%02x' $K; } || X+=${ printf ':%02x' $RANDOM; }
+		Y='lxc.network.type = '
+		(( I == 1 )) && Y+='veth' || Y+='macvlan'
+		KEY='network.hwaddr' VAL="${X:1}"
+		NETCFG+="lxc.${KEY} = ${VAL}\n"
+		CFG[${KEY}]="${VAL}"
+	fi
+
+	# try to set a static IP
+	if [[ -n ${CFG[network.type]} && \
+		( -z ${CFG[network.ipv4]} || -z ${CFG[network.hostnames]} ) ]]
+	then
+		typeset -a VAL=( ${ getent hosts ${CFG[zname]} ; } )
+		if (( ${#VAL[@]} > 1 )); then
+			[[ -z ${CFG[network.ipv4]} ]] && CFG[network.ipv4]="${VAL[0]}"
+			I=${#VAL[@]}
+			[[ -z ${CFG[network.hostnames]} ]] && \
+				CFG[network.hostnames]="${VAL[1..I]}"
+		fi
+	fi
+
+	if [[ -z ${CFG[network.ifname]} ]]; then
+		X=${CFG[zname]}
+		[[ ${CFG[zname]} =~ [0-9]$ ]] && X+=_0 || X+=0
+		CFG[network.ifname]=$X
+		NETCFG+="lxc.network.name = $X\n"
+	fi
+
+	# make sure all "implanted" mount entries are valid
+	K=0
+	if [[ -n ${FSTAB} ]]; then
+		I=1
+		print "${FSTAB}" | while read LINE ; do
+			if ! checkFstabEntry X 1 "${LINE}" ; then
+				Log.info "Internal mount entry $I (${LINE}) is invalid: $X"
+				(( K++ ))
+			fi
+		done
+	fi
+	(( K )) || CFG[fstab.int]="${FSTAB}"
+	if [[ -n ${CFG[fstab.ext]} ]]; then
+		I=1
+		while read LINE ; do
+			if ! checkFstabEntry X 0 "${LINE}" ; then
+				Log.info "Virtual fstab mount entry $I (${LINE}) is invalid: $X"
+				(( K++ ))
+			fi
+		done <${CFG[fstab.ext]}
+	fi
+
+	CFG[cfg.auto]="${AUTOCFG}"
+	CFG[cfg.net]="${NETCFG}"
+
+	return $K
+}
+
+function write_configuration {
+	typeset -n CFG=$1
+	typeset RCFG='' CONFIG="${CFG[cfgdir]}/config"
+
+	# Create the fstab - per default empty. NOTE: Each entry with an absolute
+	# mountpoint not containing ${lxc.rootfs} or ${lxc.rootfs.mount} gets
+	# ignored!
+	[[ -n ${CFG[fstab.ext]} ]] && \
+		cp "${CFG[fstab.ext]}" "${CFG[cfgdir]}/fstab" || \
+		touch ${CFG[cfgdir]}/fstab
+
+	## Add all the includes
+	RCFG+='\n'
+	RCFG+='# Common configuration\n'
+	[[ -e ${CFG[templatecfg]}/ubuntu.common.conf ]] && \
+		RCFG+="lxc.include = ${CFG[templatecfg]}/ubuntu.common.conf\n"
+	[[ -e ${CFG[templatecfg]}/ubuntu.${CFG[release]}.conf ]] && \
+		RCFG+="lxc.include = ${CFG[templatecfg]}/ubuntu.${CFG[release]}.conf\n"
+
+	## Add the container-specific config
+	RCFG+='\n'
+	RCFG+='# Container specific configuration\n'
+	RCFG+="${CFG[cfg.auto]}"
+	[[ -n ${CFG[rootfs.seen]} ]] || RCFG+="lxc.rootfs = ${CFG[rootfs]}\n"
+	[[ -n ${CFG[rootfs.opts.seen]} ]] || RCFG+='lxc.rootfs.options = noatime\n'
+	RCFG+="lxc.mount = ${CFG[cfgdir]}/fstab\n"
+	RCFG+="lxc.utsname = ${CFG[zname]}\n"
+	RCFG+="lxc.arch = ${CFG[arch]}\n"
+
+	## Re-add the previously removed network config
+	RCFG+='\n'
+	RCFG+='# Network configuration\n'
+	RCFG+="${CFG[cfg.net]}"
+
+	print "${RCFG}" >${CONFIG}
+	I=$?
+	(( I )) && Log.fatal "Failed to write container config '${CONFIG}'"
+
+	pressKey2continue ${.sh.fun}
+	return $I
+}
+
+function configure_zone {
+	typeset -n CFG=$1
+	typeset RFS="${CFG[rootfs]}" X Y Z LINE
+	integer I
+
+	write_configuration CFG || return 1
+	print ${CFG[zname]} >${RFS}/etc/hostname
+
+	[[ -n ${CFG[network.ifname]} ]] && X="${CFG[network.ifname]}" || X="eth0"
+	Y='# configure the network using the dhcp
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+\n'
+	Y+="auto $X\n"
+	if [[ -z ${CFG[network.ipv4]} || -z ${CFG[network.type]} ]]; then
+		[[ -z ${CFG[network.ipv4]} ]] && CFG[network.ipv4]='127.0.1.1'
+		Y+="iface $X inet dhcp\n"
+		Y+="#iface $X inet static\n"
+		Y+='#\taddress a.b.c.h/24"\n'
+	else
+		Y+="# iface $X inet dhcp\n"
+		Y+="iface $X inet static\n"
+		# a subnet mask of 24 is usually wanted, even for class A or B networks
+		Y+="\taddress ${CFG[network.ipv4]}/24\n"
+	fi
+	Y+='#\tgateway a.b.c.d\n'
+	Y+='#\tdns-search mydomain.de\n'
+	Y+='#\tdns-nameservers n.m.o.p q.r.s.t\n'
+	Log.warn "You probably need to adjust '${RFS}/etc/network/interfaces'" \
+		'before the container gets started the first time!'
+	print -n "$Y"> ${RFS}/etc/network/interfaces
+
+	cat >${RFS}/etc/hosts<<EOF
+127.0.0.1	localhost loghost
+${CFG[network.ipv4]}	${CFG[network.hostnames]} ${CFG[zname]}
+
+# The following lines are desirable for IPv6 capable hosts
+::1		ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+ff00::0	ip6-mcastprefix
+ff02::1	ip6-allnodes
+ff02::2	ip6-allrouters
+EOF
+
+	# tmpfs on /tmp but restrict its size
+	I=0
+	while read X Y Z ; do
+		[[ $X == 'MemTotal:' ]] && I=$Y && break
+	done </proc/meminfo
+	if (( I > 64000000 )); then
+		Z='1g'
+	elif (( I > 16000000 )); then
+		Z='512m'
+	elif (( I > 1000000 )); then
+		Z='128m'
+	else
+		Z=''
+	fi
+	X="${CFG[fstab.int]}"
+	Y='/etc/apparmor.d/lxc/lxc-default'
+	if [[ -n $X && -e $Y ]]; then
+		while read LINE ; do
+			[[ ${LINE} =~ mount[[:space:]]+options=\((rw,?|rbind,?).*\) ]] \
+				&& Y='' && break
+		done <$Y
+		[[ -n $Y ]] && \
+			Log.printMarker ${Log.RED} && \
+			Log.warn "Make sure, that '$Y' (or whatever profile you" \
+			'have set) allows rbind mounts within the zone, i.e. contains a' \
+			'rule like this "mount options=(rw, rbind),". Otherwise the zone' \
+			'may not come up properly (mountall might hang, network' \
+			'interface(s) get not initialized, etc.)!' && \
+			Log.printMarker ${Log.RED}
+		# Since apparmor is so immature, we can't simply find out, which file
+		# to change and reload it properly on demand... Furthermore the only
+		# way seems to reboot to get apparmor into a clean state after changes
+		# (sorry for not wasting more time for this toy) ...
+		#sed -e '/}/ i\\tmount options=(rw, rbind),' \
+		#	-i /etc/apparmor.d/lxc/lxc-default
+	fi
+	[[ -n $Z ]] && X+="tmpfs /tmp tmpfs defaults,size=$Z\n"
+	[[ -n $X ]] && print -n "$X" >${RFS}/etc/fstab
+
+	# suppress log level output for udev
+	sed -e 's/="err"/=0/' -i ${RFS}/etc/udev/udev.conf || true
+
+	# remove jobs for consoles 5 and 6 since we only create 4 consoles in
+	# this template
+	rm -f ${RFS}/etc/init/tty{5,6}.conf
+
+	# no "pseudo-intelligent" aka dumb guesses about locales. Either they are
+	# set or we leave as is!
+	[[ -n ${CFG[locales]} ]] && \
+		chroot ${RFS} /usr/sbin/locale-gen ${CFG[locales]}
+
+	[[ -x ${RFS}/var/lib/dpkg/info/openssh-server.postinst ]] || return 0
+
+	# generate new SSH keys
+	disable_svcs ${RFS}
+	rm -f ${RFS}/etc/ssh/ssh_host_*key*
+	mv ${RFS}/etc/init/ssh.conf ${RFS}/etc/init/ssh.conf.disabled
+	typeset -x DPKG_MAINTSCRIPT_PACKAGE=openssh DPKG_MAINTSCRIPT_NAME=postinst
+
+	chroot ${RFS} /var/lib/dpkg/info/openssh-server.postinst configure
+
+	mv ${RFS}/etc/init/ssh.conf.disabled ${RFS}/etc/init/ssh.conf
+	enable_svcs ${RFS}
+
+	sed -e "s/root@${ hostname ; }/root@${CFG[zname]}/g" \
+		-i ${RFS}/etc/ssh/ssh_host_*.pub || true
+
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function install_packages {
+	typeset -n CFG=$1
+	shift
+	typeset PKGS="$@" X='--no-install-recommends'
+
+	[[ -z ${PKGS} ]] && return 0
+
+	[[ -n ${CFG[recommended]} ]] && X=''
+	if [[ ! -d ${CFG[rootfs]}/var/cache/apt/archives \
+		&& -d ${CFG[cache.apt]}/cache ]]
+	then
+		if mount --bind ${CFG[cache.apt]}/cache ${CFG[rootfs]}/var/cache/apt
+		then
+			CFG[cache.apt.pkg]=${CFG[rootfs]}/var/cache/apt	
+			trap umountPkgCache EXIT
+		fi
+	fi
+
+	if [[ -n ${CFG[needupdate]} ]]; then
+		chroot ${CFG[rootfs]} apt-get update
+		CFG[needupdate]=''
+	fi
+
+	chroot ${CFG[rootfs]} apt-get install --force-yes -y $X ${PKGS}
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function post_install {
+	typeset -n CFG=$1
+	typeset RFS="${CFG[rootfs]}" RESOLVCONF="${RFS}/etc/resolv.conf" X Y G A \
+		HARCH=${DEFAULT[arch]}
+	integer I
+
+	disable_svcs ${RFS}
+	CFG[recommended]=''
+
+	if [[ ! -f ${RFS}/etc/init/container-detect.conf ]]; then
+		# JEL-TBD: actually lame but probably works for most users
+
+		# Make sure we have a working resolv.conf
+		[[ -e ${RESOLVCONF} ]] && mv ${RESOLVCONF} ${RESOLVCONF}.lxcbak
+		cat /etc/resolv.conf > ${RESOLVCONF}
+
+		# for lucid, if not trimming, then add the ubuntu-virt
+		# ppa and install lxcguest
+		if [[ ${CFG[release]} == 'lucid' ]]; then
+			install_packages CFG 'python-software-properties'
+			chroot ${RFS} add-apt-repository 'ppa:ubuntu-virt/ppa'
+			CFG[needupdate]=1
+		fi
+
+		CFG[recommended]=1
+		install_packages CFG lxcguest
+		CFG[recommended]=''
+
+		# Restore old resolv.conf
+		rm -f ${RESOLVCONF}
+		[[ -e ${RESOLVCONF}.lxcbak ]] && mv ${RESOLVCONF}.lxcbak ${RESOLVCONF}
+	fi
+
+	# If the container isn't running a native architecture, setup multiarch
+	X=''
+	for Y in ~(N)${RFS}/usr/bin/qemu-*-static ; do
+		[[ -x $Y ]] && X="$Y" && break
+	done
+	if [[ -n $X ]]; then
+		Y=${ chroot ${RFS} dpkg-query -W -f='${Version}' dpkg ; }
+		X="${Y//~(E)[^.0-9].*}"	# normalize to N(.M)*
+		A=( ${X//./ } 0 0 0 )
+		if (( A[0] < 1 || A[1] < 16 || A[2] < 2 )); then
+			mkdir -p ${RFS}/etc/dpkg/dpkg.cfg.d
+			print "foreign-architecture ${HARCH}" \
+				>${RFS}/etc/dpkg/dpkg.cfg.d/lxc-multiarch
+		else
+			chroot ${RFS} dpkg --add-architecture ${HARCH}
+		fi
+
+		# Write a new sources.list containing both native and multiarch entries
+		> ${RFS}/etc/apt/sources.list
+		write_sourceslist CFG ${RFS} ${CFG[arch]} native
+		[[ ${CFG[arch]} == ${HARCH} ]] || \
+			write_sourceslist CFG ${RFS} ${HARCH} multiarch
+		CFG[needupdate]=1
+
+		# Finally update the lists and install upstart using the host platform
+		X="upstart:${HARCH} mountall:${HARCH} isc-dhcp-client:${HARCH}"
+		if [[ -d ${RFS}/etc/iproute2 ]]; then
+			X+=" iproute2:${HARCH}"
+		else
+			X+=" iproute:${HARCH}"
+		fi
+		install_packages CFG $X
+	fi
+
+	# Install Packages in container
+	X="${CFG[pkgs.i]:1}"
+	if [[ -n $X ]]; then
+		Log.info "Installing packages: $X"
+		install_packages CFG ${X//,/ }
+	fi
+
+	# Set initial timezone as on host
+	X=''
+	if [[ -f /etc/timezone ]]; then
+		X=$(</etc/timezone)
+	elif [[ -f /etc/sysconfig/clock ]]; then
+		X=$( . /etc/sysconfig/clock && print "${ZONE}" )	# subshell required!
+	fi
+	[[ -n $X ]] && print "$X" > ${RFS}/etc/timezone
+	[[ ! -e ${RFS}/etc/timezone ]] && \
+		Log.warn 'Timezone not configured. Adjust it manually.' || \
+		chroot ${RFS} dpkg-reconfigure -f noninteractive tzdata
+
+	X="${CFG[upkgs]:1}"
+	if [[ -n $X ]]; then
+		Log.info "Trying to uninstall packages $X ..."
+		chroot ${RFS} apt-get -y purge ${X//,/ } || true
+	fi
+
+	# add possibly missing groups
+	X="${CFG[grps]:1}"
+	if [[ -n $X ]]; then
+		for Y in ${X//,/ } ; do
+			A=( ${Y//:/ } )
+			if [[ -z ${A[1]} ]]; then
+				groupadd -R ${RFS} $Y
+				continue
+			fi
+			G=${A[0]} A[0]='-g'
+			(( A[1] <= 100 )) && A[2]='--system'
+			groupadd -R ${RFS} ${A[@]} $G
+		done
+	fi
+
+	# just make sure, sudo group exists unless sudo is not installed
+	[[ -e ${RFS}/usr/bin/sudo ]] && groupadd -R ${RFS} --system sudo 2>/dev/null
+	
+	# rmdir /dev/shm for containers that have /run/shm
+	# I'm afraid of doing rm -rf ${RFS}/dev/shm, in case it did
+	# get bind mounted to the host's /run/shm.  So try to rmdir
+	# it, and in case that fails move it out of the way.
+	# NOTE: This can only be removed once 12.04 goes out of support
+	if [[ -e ${RFS}/dev/shm  && ! -h ${RFS}/dev/shm ]]; then
+		rmdir ${RFS}/dev/shm 2>/dev/null || mv ${RFS}/dev/shm ${RFS}/dev/shm.bak
+		ln -s /run/shm ${RFS}/dev/shm
+	fi
+
+	pressKey2continue ${.sh.fun}
+	enable_svcs ${RFS}
+}
+
+function finalize_user {
+	typeset -n CFG=$1
+	typeset RFS=${CFG[rootfs]} A U X
+	integer I
+
+	# setup the account
+	A=( '-s' ${CFG[user.shell]} )
+	if [[ -z ${CFG[bindhome]} ]]; then
+		U="${CFG[homebase]##/}/${CFG[user]}"
+		A+=( '--create-home' '--home' "/$U" )
+	else
+		A+=( '--home' "${CFG[bindhome]}" )
+		U="${CFG[bindhome]##/}"
+		print "/$U $U none bind 0 0" >> "${CFG[cfgdir]}/fstab"
+	fi
+	[[ -n ${CFG[user.gcos]} ]] && A+=( '--comment' "${CFG[user.gcos]}" )
+	[[ -n ${CFG[user.gid]} ]] && A+=( '--gid' ${CFG[user.gid]} ) && (( I++ ))
+	if [[ -n ${CFG[user.uid]} ]]; then
+		A+=( '--uid' ${CFG[user.uid]} )
+		(( I++ ))
+		(( ${CFG[user.uid]} < 1000 )) && A+=( '--system' )
+	fi
+	[[ ! -d ${RFS}/${U%/*} ]] && mkdir -p ${RFS}/${U%/*}
+
+	# we can't use -R ${RFS} because the bogus useradd wants to create user
+	#  wrt. / and not ${RFS} and thus would fail
+	chroot ${RFS} useradd "${A[@]}" ${CFG[user]}
+
+	# make sure we have a UID:GID
+	if (( I != 2 )); then
+		X=${ chroot ${RFS} id -u ${CFG[user]} ; }
+		CFG[user.uid]=${X:-1000}
+		X=${ chroot ${RFS} id -g ${CFG[user]} ; }
+		CFG[user.gid]=${X:-1000}
+	fi
+
+	# set password explicitly, since it might be already encrypted
+	X="${CFG[user.pw]}"
+	Y="${X:0:1}"
+	[[ $Y == '$' || $Y == '!' || $Y == '*' ]] && Y='-e' || Y=''
+	print "${CFG[user]}:$X" | chpasswd -R ${RFS} $Y
+
+	[[ -e ${RFS}/usr/bin/sudo ]] && chroot ${RFS} adduser ${CFG[user]} sudo
+
+	# copy ssh key file but only for newly created home (avoid overwrite)
+	X="${CFG[keyfile]}"
+	if [[ -z ${CFG[bindhome]} && -n $X && -f $X ]]; then
+		U+='/.ssh'
+		mkdir -p "${RFS}/$U"
+		cp "$X" "${RFS}/$U/authorized_keys2"
+		chown -R ${CFG[user.uid]}:${CFG[user.gid]} "${RFS}/$U"
+		chmod 0700 "${RFS}/$U"
+        Log.info "Public key file '$X' copied to '/$U'"
+	fi
+
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+
+function getPkgArch {
+	typeset X="$1"
+	# Code taken from debootstrap
+	[[ -z $X && -x /usr/bin/dpkg ]] && \
+		X=${ /usr/bin/dpkg --print-architecture 2>/dev/null ; }
+	if [[ -z $X ]]; then
+		X=${ whence udpkg ; }
+		[[ -n $X ]] && X=${ $X --print-architecture 2>/dev/null ; } || X=''
+	fi
+	[[ -z $X ]] && X=${ uname -p ; }
+	if [[ $X =~ ^(i[3-6]86|x86|athlon|linux32)$ ]]; then
+		X='i386'
+	elif [[ $X =~ ^(x86_64|amd64|linux64)$ ]]; then
+		X='amd64'
+	elif [[ $X == 'armv7l' ]]; then
+		X='armhf'
+	elif [[ $X == 'aarch64' ]]; then
+		X='arm64'
+	elif [[ $X == 'ppc64le' ]]; then
+		X='ppc64el'
+	fi
+	print -- "$X"
+}
+
+function normalizeArch {
+	typeset -n X="$1"
+	if [[ ${X:0:1} == 'i' ]]; then
+		X='ipc32'
+	elif [[ $Y == 'amd64' ]]; then
+		X='ipc64'
+	elif [[ $X == 'armhf' || $X == 'armel' ]]; then
+		X='arm32'
+	fi
+}
+
+function dumpVars {
+	typeset -n CFG=$1
+	typeset A X Y
+	integer I=0
+
+	Log.printMarker
+	Log.info 'Defaults:'
+	Log.printMarker
+	Y="${!DEFAULT[@]}"
+	if [[ -n ${ whence sort ; } ]]; then
+		A=( ${ print "${Y// /$'\n'}" | sort ; } )
+		Y="${A[@]}"
+		I=1
+	fi
+	for X in $Y ; do
+		print "$X = '${DEFAULT[$X]}'"
+	done
+	Log.printMarker
+	Log.info 'Used:'
+	Log.printMarker
+	Y="${!CFG[@]}"
+	if (( I )) ; then
+		A=( ${ print "${Y// /$'\n'}" | sort ; } )
+		Y="${A[@]}"
+	fi
+	for X in $Y ; do
+		print "$X = '${CFG[$X]}'"
+	done
+	pressKey2continue ${.sh.fun}
+}
+
+function allValid {
+	typeset -n CFG=$1
+	typeset A X Y H
+
+	if [[ -n ${CFG[muid]} || -n ${CFG[mgid]} ]]; then
+		# userNS unsupported
+		Log.fatal "This template can't be used for unprivileged containers." \
+			'\n\tYou may want to try "--template=download" instead.'
+		return 1
+	fi
+
+	# normalize trace function list
+	if [[ -n ${CFG[ftrace]} ]]; then
+		A=( ${CFG[ftrace]} )
+		X="${A[@]}"
+		CFG[ftrace]="@${X// /@}@"
+	fi
+
+	# make sure a user and distro name is set
+	[[ -z ${CFG[user]} ]] && CFG[user]="${DEFAULT[user]}"
+	[[ -z ${CFG[release]} ]] && CFG[release]="${DEFAULT[release]}"
+	if [[ -z ${CFG[release]} ]]; then
+		Log.fatal 'Strange things happen and release is not set (use -r ...)!'
+		return 2
+	fi
+	if ! [[ ${CFG[release]} =~ ^[a-z0-9]+$ ]]; then
+		Log.fatal "Invalid release codename '${CFG[release]}'!"
+		return 2
+	fi
+
+	# check, whether to bind its home and if so, whether it is available
+	if [[ -n ${CFG[bindhome]} ]]; then
+		X="${ getent passwd ${CFG[user]} ; }"
+		if [[ -z $X ]]; then
+			Log.fatal "${CFG[user]} seems to be not a valid/local account in" \
+				'the parent container!'
+			return 3
+		fi
+		Y=${X##*:}	# shell
+		X=${.sh.match%:}
+		H=${X##*:}	# home
+		A=${.sh.match%:}
+		if [[ -z $X ]] ; then
+			Log.fatal "${CFG[user]} seems to not have a home directory set!"
+			return 4
+		elif [[ ! -d $H ]]; then
+			Log.fatal "${CFG[user]}'s home directory '$H' not found!"
+			return 5
+		fi
+		A=( ${A//:/ } )
+		CFG[bindhome]="$H"
+		# if we use the same home, it make sense to use the same shell as well
+		CFG[user.shell]="$Y"
+		CFG[user.uid]="${A[2]}"
+		CFG[user.gid]="${A[3]}"
+		X=${ id -gn ${CFG[user]} 2>/dev/null ; }
+		[[ -n $X ]] && CFG[grps]+=",${X}:${A[3]}"	# add gname:GID
+		CFG[user.gcos]="${A[4..${#A[@]}-1]}"
+	fi
+	[[ -z ${CFG[user.shell]} ]] && CFG[user.shell]="${DEFAULT[user.shell]}"
+	# just in case someone defines it as defaults for the "ubuntu" user
+	[[ -z ${CFG[user.uid]} && -n ${DEFAULT[user.uid]} ]] && \
+		CFG[user.uid]=${DEFAULT[user.uid]}
+	[[ -z ${CFG[user.gid]} && -n ${DEFAULT[user.gid]} ]] && \
+		CFG[user.gid]=${DEFAULT[user.gid]}
+	[[ -z ${CFG[user.gcos]} && -n ${DEFAULT[user.gcos]} ]] && \
+		CFG[user.gcos]=${DEFAULT[user.gcos]}
+
+	# make sure a password is set
+	if [[ -z ${CFG[user.pw]} ]]; then
+		X="${ getent shadow ${CFG[user]} ; }"
+		A=( ${X//:/ } )
+		if [[ -n ${A[1]} ]]; then
+			CFG[user.pw]="${A[1]}"
+			Log.info "Password from parent for ${CFG[user]} will be used."
+		else
+			CFG[user.pw]="${DEFAULT[user.pw]}"
+			Log.info "The default password for ${CFG[user]} for will be used."
+		fi
+	fi
+
+	# debootstrap is required to populate the rootfs
+	X=${ whence qemu-debootstrap ; }
+	[[ -z $X ]] && X=${ whence debootstrap ; }
+	if [[ -z $X ]]; then
+		Log.fatal "'debootstrap' command not found! This is required"
+		return 6
+	fi
+	CFG[bootstrap]="$X"
+
+	if (( ${ id -u ; }  != 0 )); then
+		Log.fatal "This script should be run as 'root'!"
+		return 7
+	fi
+
+	# lxc-create always supplies a container name
+	if ! [[ ${CFG[zname]} =~ ^[a-z][-a-z0-9]*$ ]]; then
+		Log.fatal 'No valid container name aka cid is set (see option --name).'
+		return 8
+	fi
+
+	# lxc-create always supplies a config base path
+	if [[ -z ${CFG[cfgdir]} ]]; then
+		Log.fatal 'No config base path is set (see option --path).'
+		return 9
+	fi
+	if [[ ! -e ${CFG[cfgdir]}/config ]]; then
+		Log.fatal "The config directory ${CFG[cfgdir]} does not contain a" \
+			"'config' file!"
+		return 10
+	fi
+
+	# lxc-create always supplies a rootfs path
+	if [[ -z ${CFG[rootfs]} ]]; then
+		Log.warn 'No rootfs path is set (see option --rootfs).' \
+			'Trying to determine it automagically ...'
+		while read X Y ; do
+			[[ ${X} == 'lxc.rootfs' || ${X:0:11} == 'lxc.rootfs=' ]] || continue
+			[[ ${Y:0:1} == '=' ]] && A=( ${Y:1} ) || A=( ${X:11} )
+			if (( ${#A[@]} != 1 )); then
+				Log.fatal 'Sorry, you should play with other toys!'
+				return 10
+			fi
+			if [[ ! -d $A ]]; then
+				Log.fatal "Found 'lxc.rootfs = $A', but this directory" \
+					'does  not exist!'
+				return 11
+			fi
+			CFG[rootfs]="$A"
+			break
+		done <${CFG[cfgdir]}/config
+		[[ -z ${CFG[rootfs]} ]] && Log.fatal 'failed.' && return 10
+	fi
+
+
+	# make sure a proper, platform compatible arch is set
+	X=${DEFAULT[arch]}
+	Y="${CFG[arch]}"
+	if [[ -z $Y ]]; then
+		CFG[arch]=$X
+	elif [[ $X != $Y ]]; then
+		H="$X"
+		normalizeArch X
+		normalizeArch Y
+		if [[ $X == $Y ]]; then
+			:	# ok
+		elif [[ ${X:0:1} != ${Y:0:1} ]]; then
+			# arm|ipc|powerpc
+			Log.fatal "${CFG[arch]} containers cannot be run on $H platforms"
+			return 12
+		elif [[ ${X:3:2} == '32' && ${Y:3:2} == '64' ]] ; then
+			Log.fatal '64bit containers cannot be run on 32bit platforms.'
+			return 13
+		elif ! [[ $Y =~ ^[a-z][-0-9A-Za-z]*$ ]]; then
+			Log.fatal "Invalid architecture name '$Y'!"
+			return 14
+		fi
+	fi
+
+	# verify user script 
+	if [[ -n ${CFG[script]} && ! -x ${CFG[script]} ]]; then
+		Log.warn "Secondary hook script '${CFG[script]}' is not executable!"
+		return 15
+	fi
+
+	[[ -z ${CFG[mac.prefix]} ]] && CFG[mac.prefix]="${DEFAULT[mac.prefix]}"
+	[[ ${CFG[mac.prefix]} == {1,2}([[:xdigit:]]){0,5}(:{1,2}([[:xdigit:]])) ]] \
+		|| { Log.fatal "Invalid MAC prefix '${CFG[mac.prefix]}'"; return 16 ; }
+	
+	# setup some internals
+	[[ -z ${CFG[statedir]} ]] && CFG[statedir]=${DEFAULT[statedir]:-/var}
+	[[ -z ${CFG[cache]} ]] && CFG[cache]="${DEFAULT[cache]:-/var/cache/lxc}"
+	CFG[cache.rootfs]="${CFG[cache]}/${CFG[release]}/rootfs-${CFG[arch]}"
+	CFG[cache.partial]="${CFG[cache]}/${CFG[release]}/partial-${CFG[arch]}"
+	CFG[cache.apt]="${CFG[cache]}/${CFG[release]}/pkg"
+	CFG[lockdir]="${CFG[statedir]}/lock/subsys/lxc"
+	CFG[btrfs]=${ whence btrfs ; }
+
+	# We do not make stupid guesses for redundant paper weight. Either the user
+	# tells us what he needs, or we use the default, minimal set.
+	[[ -z ${CFG[langs]} ]] && CFG[langs]="${DEFAULT[langs]}"
+	Y=${CFG[langs]}
+	H=''
+	for X in ${Y//,/ } ; do
+		[[ ${X:0:14} == 'language-pack-' ]] && \
+			H+=",$X" || H+=",language-pack-$X"
+	done
+	CFG[langs]="$H"
+	[[ -z ${CFG[locales]} ]] && CFG[locales]="${DEFAULT[locales]}"
+
+	[[ -z ${CFG[pkgs.t]} ]] && CFG[pkgs.t]="${DEFAULT[pkgs.t]}"
+
+	X=${CFG[user.shell]}
+	if [[ -n $X ]] && [[ $X == 'ksh93' || ${X: -2:2} == 'sh' ]]; then
+		# make sure that the corresponding package gets installed
+		H=''
+		X=${ readlink -m $X ; }
+		[[ -n $X ]] && H=${ dpkg -S $X 2>/dev/null ; }
+		[[ -n $H ]] && CFG[pkgs.t]+=",${H%%:*}"
+	fi
+	[[ -z ${CFG[homebase]} ]] && CFG[homebase]="${DEFAULT[homebase]%%/}"
+
+	[[ -z ${CFG[proxy]} ]] && CFG[proxy]="${DEFAULT[proxy]}"
+	[[ ${CFG[proxy]} == 'none' ]] && CFG[proxy]=''
+	[[ -z ${CFG[proxys]} ]] && CFG[proxy]="${DEFAULT[proxys]}"
+	[[ ${CFG[proxys]} == 'none' ]] && CFG[proxys]=''
+
+	[[ -z ${CFG[mirror]} ]] && CFG[mirror]="${DEFAULT[mirror]}"
+	[[ -z ${CFG[mirrors]} ]] && CFG[mirrors]="${DEFAULT[mirrors]}"
+
+	[[ -z ${CFG[templatecfg]} ]] && CFG[templatecfg]="${DEFAULT[templatecfg]}"
+
+	# just make sure, that we do not need to quote and get no other trouble
+	# because of dumb names
+	H=''
+	for X in user.shell cfgdir rootfs statedir cache templatecfg homebase ; do
+		[[ ${CFG[$X]} =~ ^[_a-zA-Z0-9/][-_a-zA-Z0-9/]*$ ]] || \
+			{ Log.fatal "Invalid character for '$X' ('${CFG[$X]}')!" ; H=1 ; }
+	done
+	[[ -n $H ]] && return 20
+	
+	CFG[needupdate]=1
+
+	if [[ -n ${CFG[dump]} ]]; then
+		dumpVars CFG
+		return 999	# notify lxc-create: nothing done
+	fi
+
+	[[ -z ${CFG[lock.timeout]} ]] && CFG[lock.timeout]=120
+	[[ ${CFG[lock.timeout]} =~ ^[0-9]+$ && ${CFG[lock.timeout]} -gt 0 ]] || \
+		CFG[lock.timeout]=120
+	[[ ! -d ${CFG[lockdir]} ]] && { mkdir -p ${CFG[lockdir]} || return 13 ; }
+	pressKey2continue ${.sh.fun}
+	return 0
+}
+
+function doMain {
+	typeset -n CFG=$1
+	integer RES
+
+	allValid CFG				|| exit $?
+	read_configuration CFG		|| { RES=$? ; (( RES+=100 )) ; return ${RES} ; }
+	create_miniroot CFG			|| { RES=$? ; (( RES+=200 )) ; return ${RES} ; }
+	plumb_zonefs CFG			|| { RES=$? ; (( RES+=300 )) ; return ${RES} ; }
+	copy_miniroot2zone CFG		|| { RES=$? ; (( RES+=400 )) ; return ${RES} ; }
+	configure_zone CFG			|| { RES=$? ; (( RES+=500 )) ; return ${RES} ; }
+	post_install CFG			|| { RES=$? ; (( RES+=600 )) ; return ${RES} ; }
+	finalize_user CFG
+}
+
+# MAIN
+
+if [[ -r /etc/lsb-release ]]; then
+	Y=''
+	while read X ; do
+		if [[ ${X:0:11} == 'DISTRIB_ID=' ]]; then
+			Y="${X:11}"
+			DEFAULT[dist.id]="$Y"
+		elif [[ ${X:0:17} == 'DISTRIB_CODENAME=' ]]; then
+			Y="${X:17}"
+			DEFAULT[dist.name]="$Y"
+		fi
+	done </etc/lsb-release
+	[[ ${DEFAULT[dist.id]} == 'Ubuntu' && -n ${DEFAULT[dist.name]} ]] \
+		&& DEFAULT[release]="${DEFAULT[dist.name]}"
+	unset Y
+fi
+
+DEFAULT[arch]="${ getPkgArch ; }"
+[[ ${DEFAULT[arch]} =~ ^(i386|amd64)$ ]] && X='x86' || X='ports'
+DEFAULT[mirror]="${DEFAULT[mirror.$X]}"
+DEFAULT[mirrors]="${DEFAULT[mirrors.$X]}"
+
+USAGE='[-?$Id$ ]
+[-copyright?Copyright (c) 2014 Jens Elkner. All rights reserved.]
+[-license?CDDL 1.0]
+[+NAME?'"${PROG}"' - LXC template for an Ubuntu container]
+[+DESCRIPTION?This script will be used by \blxc-create\b(1) as an template to setup/populate the root filesystem for an Ubuntu based container.]
+[h:help?Print this help and exit.]
+[F:functions?Print a list of all functions available.]
+[T:trace]:[functionList?A comma separated list of functions of this script to trace (convinience for troubleshooting).] 
+[+?\bLXC supplied options\b]
+[+?]
+[n:name]:[cid?The container identifier (an alphanum string). Required.]
+[U:mapped-uid]:[num?Optional: The decimal UID within the new container, to which the effective UID running this script gets mapped to.]
+[G:mapped-gid]:[num?Optional: The decimal GID within the new container, to which the effective GID running this script gets mapped to.]
+[P:path]:[cfgdir?The directory to keep/maintain the state and configuration of the container. Required. lxc-create default: \alxc.lxcpath\a\b/\b\acid\a]
+[R:rootfs]:[path?The root directory aka / of the new container from its parent perspective. Required. lxc-create default: \alxc.rootfs\a (fallback: \acfgdir\a\b/rootfs\b)]
+[+?\bEnhancements\b]
+[+?]
+[a:arch]:[name?The name of Instruction Set Architecture (ISA) to use. On an x86 pc either \bi386\b (32bit) or \bamd64\b (64bit) and related aliases are allowed. Default: ISA of this platform ('"${DEFAULT[arch]}"')]
+[A:mac-prefix]:[prefix?The MAC address prefix to use, when a MAC address gets calculated. Format: max 6 byte values in hex separated by a colon (:), however, the last one as well as invalid values get always ignored. Setting takes effect, if the initial configuration file contains only one \blxc.network.type\b entry, which is set to \bveth\b or \bmacvlan\b, but contains no \blxc.network.hwaddr\b entry.] 
+[b:bindhome?Bind the home of the admin account (see option -u) from the parent into the new container. Default: '"'${DEFAULT[bindhome]}'"']
+[c:cache]:[path?Directory to use to cache packages und partial images. Default: '"${DEFAULT[cache]}"']
+[C:clear?Remove the whole package cache incl. metdata for the currently selected container distribution (see -r) before starting the real work. This is usually not necessary and obviously causes re-fetching all packages and metadata required for installation (100+ MiB).]
+[d:dump?Dump all internal settings used right before the setup would start and exit (i.e. nothing will be changed).]
+[f:flush-cash?Flush/remove the temporary and finally cached miniroot used to populate the container root filesystem before starting the real work (see also -k). Obviously equired is the miniroot package set gets changed. Default: '"'${DEFAULT[flush]}'"']
+[g:groups]:[grp_list?A comma separated list of \agroup_name\a\b:\b\agid\a sepcs, for groups to add to the container. \agroup_name\a must follow the usual conventions for POSIX group names. \agid\a (including the leading colon) is a number and optional. If not given, a new GID is choosen on demand. Default: '"'${DEFAULT[grps]:1}'"'] 
+[i:install]:[pkg_list?A comma separated list of names of packages which should be installed beside the common selections. Default: '"'${DEFAULT[pkgs.i]:1}'"']
+[I:uninstall]:[pkg_list?A comma separated list of the names of packages which should be uninstalled after the container has been setup. Default: '"'${DEFAULT[pkgs.u]:1}'"']
+[k:keep?Keep the created miniroot for other zone installations. Per default only the packages itself and their metadata are cached and the created miniroot gets moved to the new container (~350+-20 MiB). If -k is given, the miniroot gets copied to the new container and gets used automagicly by subsequent container setups until it gets flushed (see -f) or moved away. Since dependency calculation is slow, not using a cached miniroot might cost you ~1 minute, however, since package dependencies within as well as the integrity of the cached miniroot get not verified, it also may impose unknown security risks ... Default: '"${DEFAULT[keep.miniroot]:-do not keep}"' ]
+[l:langs]:[pkg?A comma separated list of language packs to install. For convinience the prefix "language-pack-" can be ommitted. Default: '"'${DEFAULT[langs]:1}'"']
+[L:locales]:[locale_list?A comma separated list of locales (except "C"), which should be available in the new container. Default: '"'${DEFAULT[locales]}'"']
+[m:mirror]:[url?The mirror to use for downloading main packages and recommended updates. Default: '"${DEFAULT[mirror]}"']
+[M:security-mirror]:[url?The mirror to use for downloading important security updates. Default: '"${DEFAULT[mirrors]}"']
+[p:password]:[passphrase?The initial password to set for the admin account (see option -u) in the new container. Default: same password as in its parent container or '"'${DEFAULT[user.pw]}'"' if no such account exists there.]
+[r:release]:[name?The distribution codename of the Ubuntu release to use in the container. Default: same as its parent ('"${DEFAULT[release]}"').]
+[S:auth-key]:[file?The file with public ssh keys, which should be copied to the \b.ssh/authorized_keys2\b file in the admin home. Ignored if --bindhome is specified as well. Default: none] 
+[t:pkgmin]:[pkg_list?A comma separated list of packages to seed the installation of the container. Default: '"'${DEFAULT[pkgs.t]:1}'"']
+[u:user]:[name?The name of the admin account to setup. Default: '"${DEFAULT[user]}"']
+[v:version?Print current version of this script and exit.]
+[x:http-proxy]:[url?HTTP proxy to use when downloading packages (format: http://[\ausername\a\b:\b\apassword\a\b@\b]]\aproxy_server\a[\b:\b\aport\a]]). Default: '"${DEFAULT[proxy]}"']
+[X:https-proxy]:[url?HTTPS proxy to use when downloading packages over secured connections (format: https://[\ausername\a\b:\b\apassword\a\b@\b]]\aproxy_server\a[\b:\b\aport\a]]). Default: '"${DEFAULT[proxys]}"']
+[+EXAMPLES]
+'
+X='
+[+?If no uid/gid maps have been created/granted so far:]{
+	[+?ksh93]
+	[+?integer NID=${ id -u ; } LID]
+	[+?(( NID*=65536 ))]
+	[+?(( LID=NID+65535 ))]
+	[+?print "lxc.id_map = u 0 ${NID} 65535\\nlxc.id_map = g 0 ${NID} 65535"\ ]
+	[+?\t>/tmp/lxc.cfg]
+	[+?sudo usermod -v ${NID}-${LID} -w ${NID}-${LID} ${ id -un; }]
+	[+?exit]
+}
+'
+USAGE+='
+[+?Try out this template with debug output for function read_configuration enabled, a different cache base directory and MAC prefix:]{
+	[+?lxc-create -n ngz1 -P /tmp -B dir \ ]
+	[+?\t--template='"${FPROG}"' \ ]
+	[+?\t\b--\b -T read_configuration -c /tmp/cache -A 00:00:01]
+	[+?]
+	[+?lxc-start -n ngz1 -P /tmp]
+	[+?]
+	[+?lxc-console -n ngz1 -P /tmp -e^]
+	[+?]
+	[+?lxc-stop -n ngz1 -P /tmp]
+	[+?]
+	[+?lxc-destroy -n ngz1 -P /tmp]
+}
+[+SEE ALSO?\blxc-create\b(1), \blxc-destroy\b(1)]
+[+NOTES?In contrast to other templates and lxc-* commands this template handles \blxc.mount\b[\b.entry\b]] entries in the initial configuration file passed to \blxc-create\b(1) in a different way: If there is a valid "\blxc.mount = \b\afile\a" entry, \afile\a gets copied to the file \bfstab\b in the configuration directory of the zone (see option \b-P\b) and the value \afile\a of the config entry gets accordingly replaced with the corresponding path. All valid values of \blxc.mount.entry\b lines are collected and finally append to the \b/etc/fstab\b file of the new zone. They will not re-appear in the final config file of the zone!]
+[+?Before the setup of the new zone starts, the rootfs of the zone gets fully plumbed, i.e. all required directories get created and than the datasets from the global zone aka host will be mounted as specified in the \afstab\a of the zone config directory. Finally all zone internal mounts will be made - as specified in the "not yet written /etc/fstab" of the new zone.]
+[+?When the installation terminates, all the plumbing gets reversed, i.e. nothing else except the rootfs should be mounted wrt. the new zone when this script returns.]
+'
+X="${ print ${USAGE} ; }"
+while getopts "${X}" OPT ; do
+	case "${OPT}" in
+		# common options
+		h) showUsage ; exit 0 ;;
+		F) typeset +f ; exit 0 ;;
+		T) 
+			[[ ${OPTARG} == 'ALL' ]] && Y=${ typeset +f ; } || Y=${OPTARG//,/ }
+			Y=${Y//pressKey2continue}
+			typeset -ft $Y
+			SOPT[ftrace]+=" $Y"
+			unset Y
+			;;
+		# options usually supplied by lxc-create
+		G) SOPT[mgid]="${OPTARG}" ;;
+		n) SOPT[zname]="${OPTARG}";;
+		P) SOPT[cfgdir]="${OPTARG}" ;;
+		R) SOPT[rootfs]="${OPTARG}" ;;
+		U) SOPT[muid]="${OPTARG}" ;;
+		# script specific options
+		a) SOPT[arch]=${ getPkgArch "${OPTARG}" ; } ;;
+		A) SOPT[mac.prefix]="${OPTARG}" ;;
+		b) SOPT[bindhome]=1 ;;
+		c) SOPT[cache]="${OPTARG}" ;;
+		C) SOPT[cache.apt.clear]=1 ;;
+		d) SOPT[dump]=1 ;;
+		f) SOPT[flush]=1 ;;
+		g) [[ -n ${OPTARG} ]] && SOPT[grps]+=",${OPTARG// /,}" ;;
+		i) [[ -n ${OPTARG} ]] && SOPT[pkgs.i]+=",${OPTARG// /,}" ;;
+		I) [[ -n ${OPTARG} ]] && SOPT[pkgs.u]+=",${OPTARG// /,}" ;;
+		k) SOPT[keep.miniroot]=1 ;;
+		l) [[ -n ${OPTARG} ]] && SOPT[langs]+=",${OPTARG// /,}" ;;
+		L) [[ -n ${OPTARG} ]] && SOPT[locales]+=" ${OPTARG//,/ }" ;;
+		m) SOPT[mirror]="${OPTARG}" ;;
+		M) SOPT[mirrors]="${OPTARG}" ;;
+		p) SOPT[password]="${OPTARG}" ;;
+		r) SOPT[release]="${OPTARG}" ;;
+		s) SOPT[script]="${OPTARG}" ;;	# 2ndary hook script
+		S) SOPT[keyfile]="${OPTARG}";;
+		t) [[ -n ${OPTARG} ]] && SOPT[pkgs.t]+=",${OPTARG// /,}" ;;
+		u) SOPT[user]="${OPTARG}" ;;
+		v) X=${VERSION:1:${#VERSION}-2} print "Version: ${X#* }" && exit 0 ;;
+		x) SOPT[proxy]="${OPTARG}" ;;
+		X) SOPT[proxys]="${OPTARG}" ;;
+	esac
+done
+X=$((OPTIND-1))
+shift $X && OPTIND=1
+unset X
+
+function doCleanup {
+	unplumb_zonefs SOPT
+	Log.printMarker
+}
+
+(( $# )) && Log.warn "The following operands are ignored (not suported):\n\t$@"
+trap doCleanup EXIT
+
+#typeset -ft plumb_zonefs unplumb_zonefs configure_zone write_configuration
+
+doMain SOPT || exit $?
+Log.info "Container ${SOPT[zname]} should be ready for start."
