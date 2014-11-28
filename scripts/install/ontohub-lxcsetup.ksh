@@ -1,6 +1,7 @@
 #!/bin/ksh93
 
 # see https://github.com/ontohub/ontohub/wiki/Productive-Deployment
+# https://github.com/ontohub/ontohub/wiki/Our-productive-configuration
 
 SDIR=$( cd ${ dirname $0; }; printf "$PWD" )
 MAC_PREFIX=0:80:41
@@ -8,10 +9,20 @@ ZNMASK='/24'
 ZBASE=/tmp
 
 RBENV_ROOT='/local/usr/ruby'
-RUBY_VERS='2.1.1'
+RUBY_VERS='2.1.1'	# fallback for ~ontohub/ontohub/.ruby-version
 SOLR_VERS='4.7.2'
 
 . ${SDIR}/lxc-install.kshlib || exit 1
+
+if [[ -z ${BRANCH} ]]; then
+	if [[ $ZNAME == 'ta' || $ZNAME == 'ontohub' || $ZNAME == 'www' ]]; then
+		BRANCH='master'
+	elif [[ ${ZNAME} == 'tb' ]]; then
+		BRANCH='staging'
+	else
+		BRANCH='development'
+	fi
+fi
 
 USEFIXTMP=1
 
@@ -83,11 +94,13 @@ addPkg install	libreadline6
 # pkgs are probably not needed anymore (all required for ruby build and
 # building passenger-apache2-module)
 addPkg install	apache2-dev libapr1-dev libaprutil1-dev libcurl4-openssl-dev \
-	libxml2-dev libxslt1-dev libreadline-dev
-addPkg install	curl gcc g++
-# holy cow - capybara-webkit/rugged for ontohub testing (+251M => 1436M)
-#            if you wanna waste your time, try that with qt5
-addPkg install	libqt4-dev libqtwebkit-dev cmake pkg-config 
+	libxml2-dev libxslt1-dev pkg-config libreadline-dev
+addPkg install	curl gcc g++ cmake	# only rugged needs cmake (+20 M)
+if [[ ${BRANCH} == 'development' ]]; then
+	# holy cow - capybara-webkit for ontohub testing (+230M => 1436M)
+	#            if you wanna waste your time, try that with qt5
+	addPkg install	libqt4-dev libqtwebkit-dev
+fi
 
 createZoneConfig
 installZone || exit $?
@@ -165,24 +178,47 @@ eval "$(rbenv init -)"' >${RB_PROFILE}
 	LoadModule	passenger_module	$X
 </IfModule>
 PassengerEnabled Off
-PassengerUserSwitching Off
 #PassengerLogLevel 3
 # passenger-config --ruby-command |grep Apache
 PassengerDefaultRuby ${RBENV_ROOT}/versions/${RUBY_VERS}/bin/ruby
 # passenger-config --root
 PassengerRoot ${X%/buildout*}
 PassengerMaxPoolSize 10
+# NOTE: Passenger User switching is dumb! When its parent (httpd) is running
+# as non-root user, passenger processes will run with the same euid/egid as
+# its parent. If the parent runs with euid==root, crazyness starts: If
+# PassengerUserSwitching==Off, the PassengerWatchdog, PassengerHelperAgent
+# and PassengerLoggingAgent process SWITCH to user 'nobody' and keep running
+# as it - yes, setting PassengerUser or/and PassengerGroup has no effect - BAH!
+# If PassengerUserSwitching==On is set, the PassengerWatchdog as well as the
+# PassengerHelperAgent process are running as 'root' and PassengerLoggingAgent
+# process as 'nobody'. If PassengerUser is not set, PassengerHelperAgent spawns 
+# a subprocess using the uid of the config.ru file in the AppRoot dir to satisfy
+# the request. If it is set, the "answering" process gets spawned as
+# \$PassengerUser .  So the best thing is to run the httpd as non-root service
+# with net_privaddr privileges or net_bind_service capabilities. On Linux this
+# is only possible using systemd. Unfortunately even the latest Ubuntu (utopic)
+# has no systemd support - it always coredumps and thus "booting" a zone is
+# impossible. That's why we need to take the 'living in the previous century'
+# approach =8-((( : start httpd as root and run as User webservd and run 
+# passenger as root and let it spawn as webservd as well.
+# 
+PassengerUserSwitching On
+PassengerUser webservd
+#PassengerGroup webservd
 EOF
 	chown -R ruby:staff ${RB_ETC}
 
-	# To checkk success once apache is running (the latter is brain damaged):
+	# To check success once apache is running (the latter is brain damaged):
 	# passenger-status ; passenger-memory-stats
+	Log.info "Ruby setup done."
 }
 
 function postSolr {
 	typeset X SOLRBASE='http://apache.openmirror.de/lucene/solr' \
 		REPO_SCONF=~ontohub/ontohub/solr/conf
 
+	Log.info "Tomcat solr setup ..."
 	# deploy solr on tomcat (~150 MB archive + 0.5 MB the extracted solr.war)
 	[[ ! -d ${SITEDIR}/tmp ]] && mkdir -p ${SITEDIR}/tmp
 	cd ${SITEDIR}/tmp  || return 1
@@ -203,6 +239,7 @@ function postSolr {
 	done
 	# TBD: This is dangerous/works as long as the webapp doesn't get redeployed
 	ln -sf ${REPO_SCONF} /var/lib/tomcat7/webapps/solr/conf
+	Log.info "Tomcat solr setup done."
 }
 
 X="${SDIR}/oh-update.sh"
@@ -219,7 +256,21 @@ mkdir -p $X
 chmod 0755 $X/oh-update.sh
 
 function postOntohub {
-	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub
+	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub DB
+
+	if [[ -z ${BRANCH} ]]; then
+		X=$(<~ontohub/ontohub/.git/HEAD)
+		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
+	fi
+	if [[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]]; then
+		X='-P'
+		DB='ontohub'
+	else
+		X='-P'
+		DB='ontohub_development'
+	fi
+		
+	Log.info "$0 setup ..."
 	print '# Ontohub god (process manager)
 description "Ontohub god"
 start on (net-device-up and local-filesystems)
@@ -238,44 +289,120 @@ pre-stop exec '"${OHOME}/${SCRIPT}"' stop'	>/etc/init/ontohub.conf
 	# for what it is good ...
 	[[ -d ${OHOME}/${SCRIPT%/*} ]] || mkdir -p ${OHOME}/${SCRIPT%/*}
 	print '#!/bin/ksh93
-
+OHOME='"'${OHOME}'"'
 # When fired via upstart, profiles get ignored
 RB_PROFILE=/local/usr/ruby/.profile
 [[ -z ${RBENV_ROOT} && -f ${RB_PROFILE} ]] && source ${RB_PROFILE}
 
 cd ~ontohub/ontohub	# the repo clone
 
-[[ ! -d log ]] && mkdir log
+[[ ! -d ${OHOME}/log ]] && mkdir ${OHOME}/log
+[[ ! -e log ]] && ln -s ${OHOME}/log log
 [[ ! -d tmp/pids ]] && mkdir tmp/pids
 print $$ >tmp/pids/god.pid		# well, who knows ...
-export RAILS_ENV=production HOME
+export RAILS_ENV='"${BRANCH}"' HOME
 
 if [[ $1 == "start" ]]; then
 	shift
-	exec '"${OHOME}"'/bin/god --config-file config/god/app.rb \
-		--pid tmp/pids/god.pid --log-level debug --log log/god.log "$@"
+	exec ${OHOME}/bin/god --config-file config/god/app.rb \
+		--pid tmp/pids/god.pid --log-level debug --log ${OHOME}/log/god.log "$@"
 elif [[ $1 == "stop" ]]; then
-	exec '"${OHOME}"'/bin/god terminate
+	exec ${OHOME}/bin/god terminate
 fi
 '	>${OHOME}/${SCRIPT}
 	chmod 0755 ${OHOME}/${SCRIPT}
 
-	# clone the ontohub server app repository (~35 MB)
+	DB=${ print 'SELECT COUNT(*) FROM ontology_file_extensions;' | \
+			su - ontohub -c "psql ${DB}" 2>/dev/null ; }
+	[[ -z ${DB} ]] && X+=' -R'		# a virgin db?
+
 	# buid/install gems required by ontohub server app (~420 MB)
-	su - ontohub -c "~admin/etc/oh-update.sh" 
+	[[ -n ${BRANCH} ]] && X+=" -b ${BRANCH}"
+	su - ontohub -c "~admin/etc/oh-update.sh $X"
 
 	service ontohub start
+	Log.info "$0 done."
 }
 
 function postDb {
-	service start postgresql
-	print 'create user ontohub;
-create database ontohub;
-grant all on database ontohub to ontohub;
-\q'	| su -c postgres psql
+	Log.info "$0 setup ..."
+
+	service redis-server stop
+	sed -e "/^dir / s,^.*,dir ${REDISDIR}," -i /etc/redis/redis.conf
+	service redis-server start
+
+	service postgresql stop
+
+	typeset X=${ pg_config --bindir ; } DB
+
+	[[ ! -d ${PSQLDIR}/main ]] && mkdir ${PSQLDIR}/main && \
+		chown 90:90 ${PSQLDIR}/main			# 90:90 == system contract
+	[[ -f ${PSQLDIR}/main/PG_VERSION ]] || \
+		su - postgres -c "$X/pg_ctl -D ${PSQLDIR}/main initdb"
+
+	X=${ find /etc/postgresql -name pg_hba.conf ; }
+	if [[ ! -e ${PSQLDIR}/pg_hba.conf ]]; then
+		print "# see $X for details - per default reject inet connections"'
+#TYPE	DATABASE	USER		ADDRESS		METHOD
+local	all			postgres				peer map=sysops
+local	ontohub		ontohub					peer map=ontohub
+#host	ontohub		ontohub		127.0.0.1	md5
+#host	ontohub		ontohub		::1/128		md5
+'		>${PSQLDIR}/pg_hba.conf
+	fi
+	if [[ ! -e ${PSQLDIR}/pg_ident.conf ]]; then
+		X="${X%/*}/pg_ident.conf"
+		print "# see $X for details"'
+#MAPNAME	SYSTEM-USERNAME	PG-USERNAME
+sysops		postgres		postgres
+sysops		admin			postgres
+ontohub		admin			ontohub
+ontohub		ontohub			ontohub
+ontohub		webservd		ontohub
+'		>${PSQLDIR}/pg_ident.conf
+	fi
+
+	X="${X%/*}/postgresql.conf"
+	[[ -f $X && ! -f ${X}.orig ]] && mv $X ${X}.orig || rm -f $X
+	if [[ ! -e ${PSQLDIR}/postgresql.conf ]]; then
+		sed -e "/^data_directory/ s,=.*,= '${PSQLDIR}/main'," \
+			-e "/^hba_file/ s,=.*,= '${PSQLDIR}/pg_hba.conf'," \
+			-e "/^ident_file/ s,=.*,= '${PSQLDIR}/pg_ident.conf'," \
+			${X}.orig >${PSQLDIR}/postgresql.conf
+	fi
+	ln -sf ${PSQLDIR}/postgresql.conf $X
+	service postgresql start
+
+	if [[ -z ${BRANCH} ]]; then
+		X=$(<~ontohub/ontohub/.git/HEAD)
+		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
+	fi
+	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && DB='ontohub' \
+		|| DB='ontohub_development'
+
+	# do nothing, if db[s] already exists
+	X=${ su - postgres -c "psql -l ${DB}" 2>/dev/null ; }
+	if [[ -z $X ]]; then
+		print 'create user ontohub;
+create database '"${DB}"';
+grant all on database '"${DB}"' to ontohub;
+'		| su - postgres -c psql
+	fi
+	if [[ ${DB} == 'ontohub_development' ]]; then
+		DB='ontohub_test'
+		X=${ su - postgres -c "psql -l ${DB}" 2>/dev/null ; }
+		if [[ -z $X ]]; then
+			print '
+create database '"${DB}"';
+grant all on database '"${DB}"' to ontohub;
+'			| su - postgres -c psql
+		fi
+	fi
+	Log.info "$0 setup done."
 }
 
 function postApache {
+	Log.info "$0 setup ..."
 	service apache2 stop
 
 	[[ ! -d ${SITEDIR} ]] && { mkdir -p ${SITEDIR} || return 1 ; }
@@ -285,12 +412,25 @@ function postApache {
 	# TBD: for now we make it here manually - on Solaris we would just call our
 	# httpd-setup.ksh -n ${SITEDIR##*/} \
 	#		-s -u [-o] -c -O webadm -G staff -p 80 -P 443
-	typeset CFDIR="${SITEDIR%/*}/conf" SITESUBNET=${ZIP}${ZNMASK} \
+	typeset X CFDIR="${SITEDIR%/*}/conf" SITESUBNET=${ZIP}${ZNMASK} \
 		SITECF="${CFDIR}/sites/${SITEDIR##*/}"
 
-	sed -e "/^# envvars/ a\\APACHE_CONFDIR='${CFDIR}'" -i /etc/apache2/envvars
 	[[ -d ${CFDIR}/sites ]] || mkdir -p ${CFDIR}/sites
-	# damn startup script wants 'apache2.conf'
+
+	# on Ubuntu this is needed ...
+	X=/etc/apache2/envvars
+	[[ -e $X ]] || cp -p $X ${X}.orig
+	if [[ ! -e ${CFDIR}/envvars ]]; then
+		sed -e "/^# envvars/ a\\APACHE_CONFDIR='${CFDIR}'" \
+			/etc/apache2/envvars >${CFDIR}/envvars
+		# on linux this is bash ... =8-(
+		print 'APACHE_ULIMIT_MAX_FILES=`ulimit -H -n`' >>${CFDIR}/envvars
+	fi
+	ln -sf ${CFDIR}/envvars /etc/apache2/envvars
+	# fix the debian shit
+	sed -e '/maximum number of file descriptors/ { p; N; N; N ; N; N; s,.*,\[ -n \$ULIMIT_MAX_FILES \] \&\& ulimit -S -n \$ULIMIT_MAX_FILES, ; p; x; P; P; P; }' -i /usr/sbin/apache2ctl
+
+	# damn: and this as well
 	[[ -e ${CFDIR}/apache2.conf ]] || ln -s httpd.conf ${CFDIR}/apache2.conf
 
 	# the common "minimal" set for all httpd servers
@@ -333,7 +473,7 @@ ServerName	localhost
 # MaxSpareThreads:	maximum number of worker threads which are kept spare
 # ThreadsPerChild:	constant number of worker threads in each server process.
 #					for proxy worker this also implies the max. number of
-#					connections to the backend (passenger).
+#					connections to the backend.
 # MaxClients:		maximum number of simultaneous client connections
 # MaxRequestsPerChild:	maximum number of requests a server process serves
 # ServerLimit:		automatically determined == MaxClients/ThreadsPerChild + 1 
@@ -564,9 +704,9 @@ ErrorLog	\${APACHE_LOG_DIR}/@NODENAME@.@DOMAIN@/error.log
 <IfModule rewrite_module>
 	LogLevel rewrite:error
 </IfModule>
-<IfModule passenger_module>
-	PassengerEnabled On
-</IfModule>
+#<IfModule passenger_module>
+#	PassengerEnabled On
+#</IfModule>
 
 <IfModule rewrite_module>
 	RewriteEngine On
@@ -631,7 +771,7 @@ EOF
 	[[ ! -d ${SITEDIR}/cgi-bin ]] && mkdir -p ${SITEDIR}/cgi-bin
 	[[ ! -d ${SITEDIR}/etc ]] && mkdir -p ${SITEDIR}//etc
 
-	chown -R webadm:webadm ${SITEDIR}
+	chown -R webadm:staff ${SITEDIR}
 
 	(	# avoid possible side effects
 		. /etc/apache2/envvars
@@ -643,15 +783,19 @@ EOF
 	typeset APPBASE='/local/home/ontohub/ontohub' APPNAME='ruby'
 	sed -e '/passenger.conf/ s,^#,,' -i ${SITECF%/*}/extern.conf
 		 #for now in a context dir
-	sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE}, }" -i ${SITECF}
+	sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE}, }" \
+		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
+		-i ${SITECF}
 		#later global
 #	sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}/public," \
 #		-e "/^<Directory .*\/htdocs\"?/ s,^.*,Directory ${APPBASE}/public>," \
 #		-e '/^DocumentRoot/,/^<\/Directory>/ s,\+MultiViews,-MultiViews,' \
+#		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
 #		-i ${SITECF}
 	chown -R ontohub:ontohub ${SITEDIR}
 
 	service apache2 start
+	Log.info "$0 setup ..."
 }
 
 function postGit {
@@ -668,19 +812,35 @@ exec /usr/bin/git daemon --reuseaddr --export-all --syslog \
 	--base-path='"${GITREPOS}"'
 respawn'	>/etc/init/git-serv.conf
 
-	if [[ -d ~git/.ssh/authorized_keys2 ]]; then
+	[[ -f ~git/.ssh/authorized_keys2 && ! -f ${GITSSH}/authorized_keys2 ]] && \
 		cp -p ~git/.ssh/authorized_keys2 ${GITSSH}/
-	fi
 	ln -sf ${GITSSH}/authorized_keys2 ~git/.ssh/authorized_keys2
 	chmod 0660 ${GITSSH}/authorized_keys2
 	chown -R git:ontohub ${GITSSH}
 	
 	service git-serv start
+	Log.info "$0 setup done."
+}
+
+function normalizeRubyVersion {
+	[[ -z $1 || ! -f $1 ]] && return
+	typeset X F=$1
+	# muhhhh - need to normalize to major.minor.tiny
+	X=$(<$F)
+	F="${X##~(E)[^0-9]}"
+	X=${X%-*}
+	[[ -z $X ]] && return
+	X=( ${X//./ } )
+	for (( I=${#X[@]} ; I < 3 ; I++ )); do
+		X+=( '0' )
+	done
+	F="${X[@]}"
+	print "${F// /.}"
 }
 
 function postInstall {
-	typeset X
-
+	Log.info "Running $0 ..."
+	typeset F X
 
 	# Add redis-server daily and hets repositories
 	X='http://ppa.launchpad.net/chris-lea/redis-server/ubuntu'
@@ -700,15 +860,33 @@ function postInstall {
 	apt-get install --no-install-recommends -y \
 		tomcat7 tomcat7-admin redis-server hets-server-core
 
+	# just clone the ontohub server app repository (~35 MB)
+	[[ -n ${BRANCH} ]] && X="-b ${BRANCH}" || X=''
+	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && X+=' -P'
+	su - ontohub -c "~admin/etc/oh-update.sh $X -u" 
+
+	# for cookie encryption
+	F=~ontohub/ontohub/config/initializers/secret_token.rb
+	X=' bootstrap.log: lastlog: auth.log: dmesg'
+	#X=${ ~ontohub/bin/rake secret ; }	# avoid cyclic ruby dependency
+	X=${ openssl rand -hex -rand ${X// /\/var/\/log\/} 64 ; }
+	[[ -n $X ]] && print "Ontohub::Application.config.secret_token = '$X'" >$F
+
+	# let this file dictate the ruby version to install - anyway, it is so
+	# hard to write down the correct version number ... - muhhh
+	X=${ normalizeRubyVersion ~ontohub/ontohub/.ruby-version ; }
+	[[ -n $X ]] && RUBY_VERS="$X"
+	Log.info "Using ruby version '${RUBY_VERS}'."
+
 	postDb
+	postSolr	# Gets a symlink to a repo clone sub dir!
 	postRuby
 	postApache	# Order! We include the postRuby generated passenger.conf
 	postOntohub	# Order! Deps on postRuby
-	postSolr	# Order! symlinks to a repo clone sub dir
 	postGit
-	sed -e "/^dir / s,^.*,dir = ${REDISDIR}," -i /etc/redis/redis.conf
 
 	# hets -update ==> is history @since 2014-11-18
+	Log.info "$0 done."
 }
 
 # prepare stuff for export
@@ -718,14 +896,14 @@ GITREPOS=${DATADIR[git.repos].z_dir}
 GITSSH=${DATADIR[git.ssh].z_dir}
 SITEDIR=/${DATADIR[sites].z_pool#*/}/${ZNAME}.${ZDOMAIN}
 
-FN=''
+FN=' normalizeRubyVersion'
 for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=" $X" ; done
 
 ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\n' 
 ZSCRIPT+='integer JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
 ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
 	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS RUBY_VERS RBENV_ROOT \
-	GITREPOS GITSSH ; }\n"
+	GITREPOS GITSSH BRANCH ; }\n"
 ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\n\n'
 ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"
 X="${FN// /|}"

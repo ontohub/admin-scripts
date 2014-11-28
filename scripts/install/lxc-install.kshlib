@@ -576,6 +576,8 @@ function customizeZone {
 		Log.info 'Running post-install script ...'
 		${TMPDIR}/post.sh ${ZBASE}/${ZNAME}
 	fi
+	print '*	soft	nofile	2048\n*	hard	nofile	16384' \
+		>>${ZROOT}/etc/security/limits.conf
 	Log.info 'Done.'
 }
 
