@@ -1,0 +1,205 @@
+# The contents of this file are subject to the terms of the
+# Common Development and Distribution License (the "License")
+# (see http://www.opensource.org/licenses/CDDL-1.0).
+#
+# Copyright (c) 2011 Jens Elkner. All rights reserved.
+# Use is subject to license terms.
+
+# requires . ${LIBNAME%/*}/man.kshlib
+
+############################################################################
+# Base utils
+############################################################################
+Man.addVar OLDENV 'Contains all environment variables and their values at the time when this script was called. See also \bLASTENV\b and \blistVars()\b. Used to track environment variable changes.'
+typeset -r OLDENV=${ typeset -p | egrep '^(typeset |[a-zA-Z0-9_]+=)' | \
+	egrep -v '(^(SDIR|option)| (OPTIND|OLDENV|RANDOM|LINENO|LS_COLORS|_))='; }
+	#'} make vim happy
+
+Man.addVar LASTENV 'A snapshot of environment variables. Gets updated with each \blistVars()\b call. See also \bOLDENV\b.' 
+typeset -t LASTENV="${OLDENV}"
+
+Man.addFunc listVars '' '[+NAME?listVars - list environment variable changes.]
+[+DESCRIPTION?List all environment variable changes since the last call of this function, if a non-empty argument is given. With no argument it lists all changes since sourcing this script. Basically useful for troubleshooting and development.]\n\n[arg]\n\n[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage OLDENV LASTENV; }" '}'
+function listVars {
+	typeset K L LAST CHANGED VAR LINE
+	K=${ typeset -p | egrep '^(typeset |[a-zA-Z0-9_]+=)' | \
+		egrep -v '(^(option|X)| (K|OLDENV|OPTIND|LASTENV|RANDOM|LINENO|LS_COLORS|_))='; }
+	#'} make vim happy
+	if [[ -z $1 ]]; then
+		L="${OLDENV}"
+	else
+		L="${LASTENV}"
+	fi
+	CHANGED=""
+	LAST=""
+	print "$L\n$K\n" | sort | uniq -u | while read LINE ; do
+		VAR=${LINE%%=*}
+		VAR=${VAR##* }
+		if [[ ${LAST} != ${VAR} && -n ${VAR} ]]; then
+			CHANGED+="|${VAR}"
+			LAST=${VAR}
+		fi
+	done
+	[[ -z ${CHANGED} ]] && return
+	print '==================================================================='
+	print "= VARS $1"
+	print '==================================================================='
+	print "$K\n" | egrep "(^| )(${CHANGED:1})="
+	print '==================================================================='
+	LASTENV="$K"
+}
+
+Man.addFunc getNetmaskBits '' '[+NAME?getNetmaskBits - get the number of significant netmask bits from a netmask.]
+[+DESCRIPTION?Determines the number of significant netmask bits from a netmask given in the traditional format N.N.N.N or CIDR notation /N. On success the number of bits gets printed, otherwise nothing.]
+\n\n{ \aN.N.N.N\a | \a/N\a }\n\n'
+function getNetmaskBits {
+	typeset X NM
+    [[ -z $1 ]] && return
+    NM="$1"
+    if [[ ${NM#/} != ${NM} ]]; then
+        # CIDR
+        X=${NM##/+([[:digit:]])}
+        [[ -n $X ]] && return
+        typeset -ui B=${.sh.match[1]}
+        (( B > 32 )) && return
+        print $B
+		return
+    fi
+    X=${NM/+([[:digit:]]).+([[:digit:]]).+([[:digit:]]).+([[:digit:]])}
+    [[ -n $X ]] && return
+    typeset -ui A=${.sh.match[1]} B=${.sh.match[2]} C=${.sh.match[3]} \
+		D=${.sh.match[4]}
+    (( A > 255 || B > 255 || C > 255 || D > 255 )) && return
+    typeset -ui2 N=$(( A<<24 | B<<16 | C<<8 |D ))
+    X=${N#*#}
+    B=${X##+(1)}
+    print ${#.sh.match}
+}
+
+Man.addFunc getNetmaskBitsByIP '' '[+NAME?getNetmaskBitsByIP - deduce netmask bits from an IP address.]
+[+DESCRIPTION?Deduces the default netmask from the given IP address (arg1). Prints out nothing if the argument is not an IP address, otherwise 8 for class A, 16 for class B and 24 for all other IP adresses.]
+\n\n\aN.N.N.N\a\n\n'
+function getNetmaskBitsByIP {
+    [[ -z $1 ]] && return
+    NM="$1"
+    X=${NM##+([[:digit:]]).+([[:digit:]]).+([[:digit:]]).+([[:digit:]])}
+    [[ -n $X ]] && return
+    typeset -ui A=${.sh.match[1]}
+    (( A < 127 )) && print 8 && return
+    (( A < 192 )) && print 16 && return
+    print 24
+}
+
+Man.addFunc matchIP '' '[+NAME?matchIP - check, whether an IP belongs to a given network]
+[+DESCRIPTION?Checks, whether the given IP address (arg2) belongs to the given network (arg2). The network can be denoted as N.N.N.N/MASK whereby MASK might be a single number (CIDR notation) or classic netmask of the form M.M.M.M. If the given IP address belongs to the given network, this function prints out the IP address. Otherwise nothing gets printed.]
+\n\n\anetwork\a \aip\a\n\n
+[+SEE ALSO?\bnetmasks\b(4)]'
+function matchIP {
+	typeset XBITS XIP X X1
+	[[ -z $1 || -z $2 ]] && return
+	XBITS=$(( 32 - ${1#*/} ))
+	XIP=${1%/*}
+    X=${XIP/+([[:digit:]]).+([[:digit:]]).+([[:digit:]]).+([[:digit:]])}
+    [[ -n $X ]] && return
+    typeset -ui A=${.sh.match[1]} B=${.sh.match[2]} C=${.sh.match[3]} \
+		D=${.sh.match[4]}
+    (( A > 255 || B > 255 || C > 255 || D > 255 )) && return
+    typeset -ui16 XNET=$(( A<<24 | B<<16 | C<<8 | D ))
+
+    X1=${2/+([[:digit:]]).+([[:digit:]]).+([[:digit:]]).+([[:digit:]])}
+    [[ -n $X1 ]] && return
+    A=${.sh.match[1]} B=${.sh.match[2]} C=${.sh.match[3]} D=${.sh.match[4]}
+    (( A > 255 || B > 255 || C > 255 || D > 255 )) && return
+    typeset -ui16 XDIP=$(( A<<24 | B<<16 | C<<8 | D ))
+	(( XNET>>=XBITS ))
+	(( XDIP>>=XBITS ))
+	(( XNET == XDIP )) && print $2 
+}
+
+Man.addVar DEFAULTIF 'Default NIC of the global zone. Only set, if \bgetDefaultIfAndMac\b() gets called.'
+
+Man.addVar MAC 'Default Mac address to use for primary VNIC of the zone. Only set, if \bgetDefaultIfAndMac\b() gets called.'
+
+Man.addVar MAC_PREFIX 'The first 3 bytes (zero padded!) to use, when a new MAC address needs to be generated. Default: "00:01:01" - PRIVATE according to http://standards.ieee.org/regauth/oui/oui.txt . See \bgetDefaultIfAndMac()\b.'
+[[ -z ${MAC_PREFIX} ]] && typeset MAC_PREFIX='00:01:01'
+
+Man.addFunc getDefaultIfAndMac '' '[+NAME?getDefaultIfAndMac - determine the default network interface and MAC address.]
+[+DESCRIPTION?Tries to find out the default network interface to use for new VNICs, which is the one containing the default IP route for this zone. On success \bDEFAULTIF\b gets set to this value and the default MAC address to use (\bMAC\b) gets set. Otherwise \bMAC\b stays unset and \bDEFAULTIF\b gets set to the interface {\auname -n\a}0 (which might be wrong).]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DEFAULTIF MAC_PREFIX MAC; }" '}
+[+SEE ALSO?\broute\b(1M), \bipadm\b(1M), \bdladm\b(1M), \bhostname\b(1)]'
+function getDefaultIfAndMac {
+	typeset X IP A
+	MAC=''
+	X=( ${ ip route show match default 2>/dev/null ; } )
+	(( ${#X[@]} >= 5 )) && DEFAULTIF="${X[4]}"
+	if [[ -n ${DEFAULTIF} ]]; then
+		X=( ${ ip addr show ${DEFAULTIF} 2>/dev/null; } )
+		IP="${X[@]}"
+		if [[ ${IP} =~ \ inet\  ]]; then
+			X=${IP#*inet }
+			IP=${X%%/*}
+			typeset -a -i B=( ${IP//./ } )
+			integer K=0
+			typeset -A ZBASES
+			ZBASES[${ZBASE}]=1
+			# auto detect zones with a different lxc.path
+			while read -A A ; do
+				X="${A[7]}"
+				[[ ${X:0:1} == '@' && ${X: -8} == '/command' ]] || continue
+				X="${X:1:${#X}-9}"
+				[[ -f $X/config ]] && ZBASES[${X%/*}]=1
+			done </proc/net/unix
+			# count configured zones
+			for A in ${!ZBASES[@]} ; do
+				for X in ~(N)$A/*/config ; do
+					[[ -n $X ]] && (( K++ ))
+				done
+			done
+			(( K++ ))
+			if (( K < 16 )); then
+				(( K*=16 ))
+			elif (( K < 32 )); then
+				(( K*=8 ))
+			elif (( K < 64 )); then
+				(( K*=4 ))
+			else
+				(( K=(RANDOM & 255) ))
+			fi
+
+			# 11.1 accepts zero padded mac addresses, only
+			MAC=${ printf "%s:%02x:%02x:%02x" $MAC_PREFIX ${B[2]} ${B[3]} $K; }
+		fi
+	else
+		DEFAULTIF=${ hostname; }0
+	fi
+}
+
+Man.addFunc normalizeMac '' '[+NAME?normalizeMac - normalize a MAC address]
+[+DESCRIPTION?Normalizes the given \amacaddress\a (i.e. backslashes removed, zero padded, lower case) and prints it to stdout.]
+\n\n\amacaddress\a
+'
+function normalizeMac {
+	[[ -z $1 ]] && return
+	typeset -l M=${1//\\}
+	typeset -a A=( ${M//:/ } )
+	M=''
+	for X in "${A[@]}" ; do
+		(( ${#X} < 2 )) && M+=":0$X" || M+=":$X"
+	done
+	print ${M:1}
+}
+
+Man.addFunc getIP '' '[+NAME?getIP - get the IP address for the given hostname.]
+[+DESCRIPTION?Tries to determine the IP address from the given hostname (arg1). If it matches N.N.N.N, where N is a digit, it gets print out as is. Otherwise the hosts database will be used to lookup the IP address. On success the IP adress found gets printed, otherwise nothing.]
+\n\n\ahostname\a\n\n
+[+SEE ALSO?\bgetent\b(1M)]'
+function getIP {
+	[[ -z $1 ]] && return
+	typeset X=$1 T
+	T=${X##+([[:digit:]]).+([[:digit:]]).+([[:digit:]]).+([[:digit:]])}
+	[[ -z $T ]] && print $X && return
+	X=${ getent hosts $X; }
+	[[ -n $X ]] && print ${X%%+(\s)*}
+}
+
+# vim: ts=4 filetype=sh
