@@ -1,6 +1,8 @@
 #!/bin/ksh93 -e
 
 # Template script for generating ubuntu container for LXC.
+# Copy it to the GZ's /usr/share/lxc/templates/lxc-ubuntu-csmd to be able to
+# use just  lxc-create -t ubuntu-csmd  ...
 
 # This script consolidates and extends the existing lxc ubuntu scripts.
 # It tries to be as compatible as possible to the limited setup script coming
@@ -562,7 +564,7 @@ function read_configuration {
 		while read -A A ; do
 			Y="${A[7]}"
 			[[ ${Y:0:1} == '@' && ${Y: -8} == '/command' ]] || continue
-			Y="${X:1:${#Y}-9}"
+			Y="${Y:1:${#Y}-9}"
 			[[ -f $Y/config ]] && ZBASES[${Y%/*}]=1
 		done</proc/net/unix
 		K=0
