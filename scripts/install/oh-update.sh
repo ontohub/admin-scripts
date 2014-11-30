@@ -126,13 +126,8 @@ function buildGems {
 		return 3
 	CFG[bvers]="${A[-1]}"
 
-	if [[ -n ${CFG[prod]} ]]; then
-		export RAILS_ENV='production'
-	elif [[ -n ${CFG[branch]} ]]; then
-		export RAILS_ENV="${CFG[branch]}"
-	else
-		unset RAILS_ENV
-	fi
+	[[ -n ${CFG[prod]} ]] && RAILS_ENV='production' || RAILS_ENV='development'
+	export RAILS_ENV
 
 	[[ ${RAILS_ENV} == 'production' ]] && X='vendor/bundle' || X='../ruby'
 	if [[ -f ${CFG[dest]}/VERSION && -d $X ]]; then
@@ -150,6 +145,8 @@ function buildGems {
 	sed -e 's,username:.*,username: ontohub,' -i config/database.yml
 
 	Log.info 'Trying to build ontohub gems ...'
+	# discard any settings from previous runs (especially BUNDLE_WITHOUT:)
+	rm -f .bundle/config
 
 	# 1693M
 	if [[ ${RAILS_ENV} == 'production' ]]; then
@@ -179,6 +176,8 @@ function buildGems {
 	# for convinience put the tools into a std path
 	[[ -d ~/bin ]] || mkdir ~/bin
 	[[ -d ~/bin ]] && bundler install --binstubs ~/bin
+
+	# NOTE: W/o having RAILS_ENV set, it assumes RAILS_ENV=production ...
 	~/bin/rake assets:precompile
 
 	# recommended by builder doc - no clue, whether it makes a diff
@@ -196,15 +195,12 @@ function buildGems {
 
 function resetDb {
 	cd "${CFG[repo]}" || return 4
-	if [[ -n ${CFG[prod]} ]]; then
-		export RAILS_ENV='production'
-	elif [[ -n ${CFG[branch]} ]]; then
-		export RAILS_ENV="${CFG[branch]}"
-	else
-		unset RAILS_ENV
-	fi
 
 	Log.info 'Resetting database ...'
+
+	[[ -n ${CFG[prod]} ]] && RAILS_ENV='production' || RAILS_ENV='development'
+	export RAILS_ENV
+
 	~/bin/rake db:migrate:reset
 	~/bin/rake sunspot:solr:start
 	~/bin/rake db:seed
@@ -227,7 +223,7 @@ function doMain {
 
 	# just a _simple_ check - developers w/o 64bit should not develop ;-)
 	typeset LIB='/usr/lib/x86_64-linux-gnu/libQtWebKit.so'
-	if [[ ! -x ${LIB} ]] && [[ ${CFG[prod]} != '1' ]]; then
+	if [[ ! -e ${LIB} ]] && [[ ${CFG[prod]} != '1' ]]; then
 		Log.info 'Missing QtWebKit - switching to production mode.'
 		CFG[prod]=1
 	fi

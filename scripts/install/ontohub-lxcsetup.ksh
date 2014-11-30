@@ -20,9 +20,10 @@ if [[ -z ${BRANCH} ]]; then
 	elif [[ ${ZNAME} == 'tb' ]]; then
 		BRANCH='staging'
 	else
-		BRANCH='development'
+		BRANCH='develop'
 	fi
 fi
+Log.info "Using branch '${BRANCH}' as zone's default branch ..."
 
 USEFIXTMP=1
 
@@ -96,7 +97,7 @@ addPkg install	libreadline6
 addPkg install	apache2-dev libapr1-dev libaprutil1-dev libcurl4-openssl-dev \
 	libxml2-dev libxslt1-dev pkg-config libreadline-dev
 addPkg install	curl gcc g++ cmake	# only rugged needs cmake (+20 M)
-if [[ ${BRANCH} == 'development' ]]; then
+if [[ ${BRANCH} != 'master' && ${BRANCH} != 'staging' ]]; then
 	# holy cow - capybara-webkit for ontohub testing (+230M => 1436M)
 	#            if you wanna waste your time, try that with qt5
 	addPkg install	libqt4-dev libqtwebkit-dev
@@ -252,11 +253,11 @@ X="${ZROOT}/local/home/admin/etc/"
 mkdir -p $X
 [[ -e ${SDIR}/oh-update.sh ]] && cp ${SDIR}/oh-update.sh $X || \
 	print 'echo Fetch $0 from http://iws.cs.ovgu/~elkner/ubuntu/oh-update.sh' \
-		'and run it using option -P' >$X/oh-update.sh
+		'and run it.' >$X/oh-update.sh
 chmod 0755 $X/oh-update.sh
 
 function postOntohub {
-	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub DB
+	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub X DB RAILS_ENV
 
 	if [[ -z ${BRANCH} ]]; then
 		X=$(<~ontohub/ontohub/.git/HEAD)
@@ -265,9 +266,11 @@ function postOntohub {
 	if [[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]]; then
 		X='-P'
 		DB='ontohub'
+		RAILS_ENV='production'
 	else
-		X='-P'
+		X=''
 		DB='ontohub_development'
+		RAILS_ENV='development'
 	fi
 		
 	Log.info "$0 setup ..."
@@ -275,8 +278,6 @@ function postOntohub {
 description "Ontohub god"
 start on (net-device-up and local-filesystems)
 stop on runlevel [016]
-
-env HOME='"${OHOME}"'
 
 respawn
 setuid ontohub
@@ -290,6 +291,7 @@ pre-stop exec '"${OHOME}/${SCRIPT}"' stop'	>/etc/init/ontohub.conf
 	[[ -d ${OHOME}/${SCRIPT%/*} ]] || mkdir -p ${OHOME}/${SCRIPT%/*}
 	print '#!/bin/ksh93
 OHOME='"'${OHOME}'"'
+RAILS_ENV='"${RAILS_ENV}"'
 # When fired via upstart, profiles get ignored
 RB_PROFILE=/local/usr/ruby/.profile
 [[ -z ${RBENV_ROOT} && -f ${RB_PROFILE} ]] && source ${RB_PROFILE}
@@ -300,7 +302,7 @@ cd ~ontohub/ontohub	# the repo clone
 [[ ! -e log ]] && ln -s ${OHOME}/log log
 [[ ! -d tmp/pids ]] && mkdir tmp/pids
 print $$ >tmp/pids/god.pid		# well, who knows ...
-export RAILS_ENV='"${BRANCH}"' HOME
+export RAILS_ENV HOME
 
 if [[ $1 == "start" ]]; then
 	shift
@@ -335,6 +337,13 @@ function postDb {
 
 	typeset X=${ pg_config --bindir ; } DB
 
+	if [[ -z ${BRANCH} ]]; then
+		X=$(<~ontohub/ontohub/.git/HEAD)
+		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
+	fi
+	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && DB='ontohub' \
+		|| DB='ontohub_development'
+
 	[[ ! -d ${PSQLDIR}/main ]] && mkdir ${PSQLDIR}/main && \
 		chown 90:90 ${PSQLDIR}/main			# 90:90 == system contract
 	[[ -f ${PSQLDIR}/main/PG_VERSION ]] || \
@@ -345,7 +354,7 @@ function postDb {
 		print "# see $X for details - per default reject inet connections"'
 #TYPE	DATABASE	USER		ADDRESS		METHOD
 local	all			postgres				peer map=sysops
-local	ontohub		ontohub					peer map=ontohub
+local	'"${DB}"'	ontohub					peer map=ontohub
 #host	ontohub		ontohub		127.0.0.1	md5
 #host	ontohub		ontohub		::1/128		md5
 '		>${PSQLDIR}/pg_hba.conf
@@ -372,13 +381,6 @@ ontohub		webservd		ontohub
 	fi
 	ln -sf ${PSQLDIR}/postgresql.conf $X
 	service postgresql start
-
-	if [[ -z ${BRANCH} ]]; then
-		X=$(<~ontohub/ontohub/.git/HEAD)
-		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
-	fi
-	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && DB='ontohub' \
-		|| DB='ontohub_development'
 
 	# do nothing, if db[s] already exists
 	X=${ su - postgres -c "psql -l ${DB}" 2>/dev/null ; }
@@ -748,6 +750,7 @@ ScriptAlias	/cgi-bin/ ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin/
 #<Location /@appName@/>
 #	PassengerBaseURI /@appName@
 #	PassengerAppRoot @appDir@
+#	PassengerAppEnv production
 #</Location>
 
 #<Directory "/web">
@@ -780,11 +783,15 @@ EOF
 	)
 
 	# ontohub specials
-	typeset APPBASE='/local/home/ontohub/ontohub' APPNAME='ruby'
+	typeset APPBASE='/local/home/ontohub/ontohub' APPNAME='ruby' \
+		RENV='development'
+	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && RENV='production'
+	
 	sed -e '/passenger.conf/ s,^#,,' -i ${SITECF%/*}/extern.conf
 		 #for now in a context dir
 	sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE}, }" \
 		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
+		-e "/PassengerAppEnv/ s,production,${RENV}," \
 		-i ${SITECF}
 		#later global
 #	sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}/public," \
@@ -906,6 +913,7 @@ ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
 	GITREPOS GITSSH BRANCH ; }\n"
 ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\n\n'
 ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"
+ZSCRIPT+='#typeset -ft ${ typeset +f ; }\n\n'
 X="${FN// /|}"
 ZSCRIPT+='[[ -z $1 ]] && Log.fatal "Usage: $0 {postInstall'"${X//|postInstall}"'}" && exit 1\n$1'
 print "${ZSCRIPT}" >${ZROOT}/local/home/admin/etc/post-install2.sh
