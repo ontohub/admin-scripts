@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [[ "$(whoami)" != 'ontohub' ]]; then
+  echo "${BASH_SOURCE[0]}"
+  exec su ontohub -c "bash ${BASH_SOURCE[0]}"
+fi
+
 # |----------------|
 # | How this works |
 # |----------------|
