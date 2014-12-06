@@ -1,11 +1,17 @@
 #!/bin/ksh93
 
 unset CFG LC_ALL LANG LANGUAGE
+
+MY_ORG="© 2012-${ date +%Y ; } Universität Magdeburg and Universität Bremen"
+MY_NAME='Ontohub'
+
 typeset -A CFG
 export LC_CTYPE=C LC_MESSAGES=C LC_COLLATE=C LC_TIME=C GIT=${ whence git ; }
+integer HAS_SOLR=0
 
-CFG[url]='https://github.com/ontohub/ontohub'
+CFG[url]='https://github.com/ontohub/ontohub.git'
 CFG[repo]=${HOME%%/}/ontohub CFG[dest]=${HOME%%/}
+CFG[datadir]=/data/git
 
 LIC='[-?$Id$ ]
 [-copyright?Copyright (c) 2014 Jens Elkner. All rights reserved.]
@@ -31,8 +37,8 @@ function normalizeRubyVersion {
     typeset X F=$1
     # muhhhh - need to normalize to major.minor.tiny
     X=$(<$F)
-    F="${X##~(E)[^0-9]}"
-    X=${X%-*}
+    F="${X#~(E)[^0-9]*}"
+    X=${F%-*}
     [[ -z $X ]] && return
     X=( ${X//./ } )
     for (( I=${#X[@]} ; I < 3 ; I++ )); do
@@ -42,8 +48,15 @@ function normalizeRubyVersion {
 	print "${F// /.}"
 }
 
+function getRepoRubyVersion {
+	cd "${CFG[repo]}" || return 4
+	typeset X=$(<.ruby-version) Y=${ normalizeRubyVersion .ruby-version ; }
+	[[ -n $Y ]] && print "$Y"
+	cd - >/dev/null
+}
+
 function updateRepo {
-	typeset OUT=''
+	typeset OUT='' X Y
 	integer PULL=1
 
 	if [[ ! -d ${CFG[repo]%/*} ]]; then
@@ -86,6 +99,85 @@ function updateRepo {
 	CFG[head]=${ ${GIT} rev-parse HEAD ; }
 	[[ -z ${CFG[head]} ]] && \
 		Log.warn 'Unable to determine the ID of the current HEAD.'
+
+	# At least on Ubuntu amd64 ruby whines about unspecific versions like 2.1
+	X=$(<.ruby-version)
+	Y=${ normalizeRubyVersion .ruby-version ; }
+	[[ -n $X && $X != $Y ]] && \
+		Log.warn "Changing incorrect .ruby-version '$X' to '$Y'!" && \
+		print "$Y" >.ruby-version
+
+	if (( ! PULL )); then
+		# base config for the first time
+		typeset A B X HNAME
+		integer I
+		A=( ${ getent hosts ${ hostname ; } ; } )
+		for (( I=1 ; I < ${#A[@]}; I++ )); do
+			B=( ${A[I]//./ } )
+			(( ${#B[@]} > 1 )) && HNAME="${A[I]}" && break
+		done
+		if [[ -n ${HNAME} ]]; then
+			if [[ ${CFG[branch]} == 'staging' ]]; then
+				MY_NAME+=' β'
+			elif [[ ${CFG[branch]} != 'master' ]]; then
+				MY_NAME+=' Γ'
+			fi
+			sed -e "/^hostname:/ s,:.*,: ${HNAME}," \
+				-e "/^email:/ s,:.*,: noreply@${HNAME#*.}," \
+				-e "s,about.example.com,${HNAME}/about/," \
+				-e "s,exceptions@example.com,ontohub@${HNAME#*.}," \
+				-e "s,exception-recipient@example.com,exceptions@${HNAME#*.}," \
+				-e "s,ontohub exception,ontohub ex," \
+				-e "/^name:/ s,:.*,: '${MY_NAME}'," \
+				-e "/text: Foo Institute/ s,:.*,: ${MY_ORG}," \
+				-i config/settings.yml
+		fi
+
+		# for cookie encryption
+		F=~ontohub/ontohub/config/initializers/secret_token.rb
+		X=' bootstrap.log: lastlog: auth.log: dmesg'
+		#X=${ ~ontohub/bin/rake secret ; }  # avoid cyclic ruby dependency
+		X=${ openssl rand -hex -rand ${X// /\/var/\/log\/} 64 ; }
+		[[ -n $X ]] && print "Ontohub::Application.config.secret_token = '$X'" \
+			>$F
+
+		# we have the redirect rules included within the vhosts's httpd config
+		rm -f public/.htaccess
+	fi
+
+	# "no git.datadir setting" workaround
+	if [[ -n ${CFG[datadir]} && -d ${CFG[datadir]} ]]; then
+		if [[ -d data && ! -h data ]]; then
+			integer K
+			for (( K=999; K > -1; K-- )); do
+				[[ -d data.$K ]] || break
+			done
+			if (( K < 0 )); then
+				Log.info "Skipping symlinking data to '${CFG[datadir]}'." \
+					'Too many old backup dirs. rm data.* to cleanup.'
+				return 10
+			fi
+			mv data data.$K || return 11
+		else
+			rm -f data || return 12	
+		fi
+		ln -s ${CFG[datadir]} data || return 13
+	elif [[ ! -e data ]]; then	# do not change, if it already exists
+		mkdir data && chmod g+w data || return 13
+	fi
+
+	# move to somewhere else?
+	if [[ ! -e log ]]; then
+		# passenger wanna write its production.log/sidekiq.log  here =8-(
+		# god.log comes from the god-serv service (is relocatable)
+		mkdir log || return 14
+		touch log/production.log
+		chmod g+w log log/production.log
+	fi
+	if [[ ! -e ~/log ]]; then
+		mkdir ~/log && chmod g+w ~/log
+	fi
+
 	return 0
 }
 
@@ -95,16 +187,10 @@ function buildGems {
 	[[ -z ${RUBY} ]] && Log.fatal "No 'ruby' installed?" && return 1
 	cd "${CFG[repo]}" || return 4
 
-	# At least on Ubuntu amd64 ruby whines about unspecific versions like 2.1
-	X=$(<.ruby-version)
-	Y=${ normalizeRubyVersion .ruby-version ; }
-	[[ -n $X && $X != $Y ]] && \
-		Log.warn "Changing incorrect .ruby-version '$X' to '$Y'!" && \
-		print "$Y" >.ruby-version
-
 	A=( ${ ${RUBY} -e 'puts RUBY_VERSION' 2>/dev/null ; } )
-	if [[ -z $A ]]; then
-		cd /		# need the sys defaults
+	Y=${ getRepoRubyVersion ; }
+	if [[ -z $A || $A != $Y ]]; then
+		[[ -z $A ]] && cd /		# need the sys defaults
 		CFG[rvers]=${ ${RUBY} -e 'puts RUBY_VERSION' 2>/dev/null ; }
 		Log.warn "The required ruby version '$Y' seems not to be installed." \
 			"You can use '${CFG[rvers]}' when you change the content of your" \
@@ -141,7 +227,7 @@ function buildGems {
 
 	# Preconfigure - who knows, why ...
 	# git stash ; git stash apply
-	sed -e "/group: / s,:.*,: 'ontohub'," -i config/settings/production.yml
+	sed -e "/group: / s,:.*,: 'webservd'," -i config/settings/production.yml
 	sed -e 's,username:.*,username: ontohub,' -i config/database.yml
 
 	Log.info 'Trying to build ontohub gems ...'
@@ -185,7 +271,7 @@ function buildGems {
 	ln -sf ../vendor/bundle shared/vendor_bundle
 
 	# tell possibly running passengers to restart
-	[[ -d tmp ]] || mkdir tmp
+	[[ -d tmp ]] || { mkdir tmp ; chmod g+w tmp ; }
 	touch tmp/restart.txt
 
 	# stamp this build
@@ -201,10 +287,18 @@ function resetDb {
 	[[ -n ${CFG[prod]} ]] && RAILS_ENV='production' || RAILS_ENV='development'
 	export RAILS_ENV
 
-	~/bin/rake db:migrate:reset
-	~/bin/rake sunspot:solr:start
-	~/bin/rake db:seed
-	~/bin/rake sunspot:solr:stop
+	redis-cli flushdb
+	if (( HAS_SOLR )); then
+		~/bin/rake db:migrate:reset
+		~/bin/rake sunspot:solr:start
+		~/bin/rake db:seed
+		~/bin/rake sunspot:solr:stop
+	else
+		~/bin/rake elasticsearch:wipe
+		~/bin/rake db:migrate:clean
+		~/bin/rake db:seed
+		~/bin/rake db:migrate
+	fi
 
 	touch tmp/restart.txt
 }
@@ -233,6 +327,8 @@ function doMain {
 	updateRepo || { Log.fatal 'Update failed.' ; return 4 ; }
 	[[ -n ${CFG[update]} ]] && return 0
 
+	grep -q _solr Gemfile && HAS_SOLR=1
+
 	if ! buildGems ; then
 		Log.fatal 'Building gems failed.'
 		return 5
@@ -250,11 +346,13 @@ Man.addFunc MAIN '' '[+NAME?'"$PROG"' - setup or update the ontohub application 
 [T:trace]:[fname_list?A comma or whitspace separated list of function names, which should be traced during execution.]
 [+?]
 [b:branch]:[name?The name of the branch to switch to/checkout before doing anything. Default: \b$BRANCH\b if set, otherwise use as is.]
+[D:datadir]:[dir?The base directory where the application/git gets redirected to store its data. Since the application has no appropriate setting but uses always $PassengerAppRoot/data/* alias ~ontohub/ontohub/data/* for git data, \bdata\b gets symlinked to the given \adir\a if it actually exists. Default: '"${CFG[datadir]}"']
 [d:destbase]:[dir?The directory where the gems \bbundler\b should store the application gems. The bundler creates a \bruby\b/\aVERSION\a sub directory beneath it, where it will store all the libs, docs and utilities. Default: '"${CFG[dest]}"']
 [P:production?Build the production environment, i.e. do not include development or test related modules. Usually used on servers to reduce runtime dependencies and space consumption.]
 [R:reset?Reset and seed the database after the a successful deployment of the web application.]
 [r:repobase]:[dir?The directory which contains/will contain the OAR clone \bontohub\b. Default: '"${CFG[repo]}"']
 [u:update?Just clone/update the repository but do not build the gems.]
+[+NOTES?Just in case: If deployed in "production" mode \bconfig/environments/production.rb\b will be used, otherwise \bdevelopment.rb\b or \btest.rb\b. To run rails without Apache httpd in front of it in production mode (i.e. cd ~ontohub/ontohub; rails server), one needs to set \bconfig.serve_static_assets = true\b in \bproduction.rb\b to avoid ActionController::RoutingErrors for static content.]
 '
 X="${ print ${Man.FUNC[MAIN]} ; }"
 while getopts "${X}" option ; do
@@ -271,6 +369,8 @@ while getopts "${X}" option ; do
 		T) [[ ${OPTARG} == 'ALL' ]] && typeset -ft ${ typeset +f ; } || \
 			typeset -ft ${OPTARG//,/ } ;;
 		b) CFG[branch]="${OPTARG// /_}" ;;
+		D) [[ -d ${OPTARG} ]] && CFG[datadir]="${OPTARG}" || \
+			Log.warn "Git data dir '${OPTARG}' doesn't exist - ignored." ;;
 		d) CFG[dest]="${OPTARG}" ;;
 		P) CFG[prod]=1 ;;
 		r) CFG[repo]="${OPTARG%%/}/ontohub" ;;

@@ -258,7 +258,7 @@ function setDirPermissions {
 		for I in {4..6}; do (( MODE+=${PERM_GROUP[${LS[0]:$I:1}]} )) ; done
 		for I in {7..9}; do (( MODE+=${PERM_OTHER[${LS[0]:$I:1}]} )) ; done
 		if (( MODE != DS.mode )); then
-			DS.dump
+			#DS.dump
 			Log.info "Permission mismatch: ${DIR} ${MODE} != ${DS.mode}"
 			${PREFIX} chmod ${DS.mode:2} "${DIR}" || (( ERROR++ ))
 		fi
