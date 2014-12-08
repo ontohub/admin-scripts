@@ -122,11 +122,16 @@ function updateRepo {
 			elif [[ ${CFG[branch]} != 'master' ]]; then
 				MY_NAME+=' Γ'
 			fi
+			X='@'
+			[[ ${BRANCH} != 'production' && ${HNAME#*.} == 'ontohub.org' ]] && \
+				HNAME="${HNAME%%.*}.iws.cs.ovgu.de" && X="+oh-${HNAME%%$.*}@"
+			Y=${HNAME#*.}
 			sed -e "/^hostname:/ s,:.*,: ${HNAME}," \
-				-e "/^email:/ s,:.*,: noreply@${HNAME#*.}," \
+				-e "/^email:/ s,:.*,: noreply${X}${Y}," \
+				-e "/^fallback_commit_email:/ s,:.*,: ontohub_system${X}${Y}," \
 				-e "s,about.example.com,${HNAME}/about/," \
-				-e "s,exceptions@example.com,ontohub@${HNAME#*.}," \
-				-e "s,exception-recipient@example.com,exceptions@${HNAME#*.}," \
+				-e "s,exceptions@example.com,ontohub${X}${Y}," \
+				-e "s,exception-recipient@example.com,ex${X}${Y}," \
 				-e "s,ontohub exception,ontohub ex," \
 				-e "/^name:/ s,:.*,: '${MY_NAME}'," \
 				-e "/text: Foo Institute/ s,:.*,: ${MY_ORG}," \
@@ -143,6 +148,9 @@ function updateRepo {
 
 		# we have the redirect rules included within the vhosts's httpd config
 		rm -f public/.htaccess
+
+		sed -e '/.development-state/ a\      display: none' \
+			-i app/assets/stylesheets/navbar.css.sass
 	fi
 
 	# "no git.datadir setting" workaround
@@ -163,20 +171,22 @@ function updateRepo {
 		fi
 		ln -s ${CFG[datadir]} data || return 13
 	elif [[ ! -e data ]]; then	# do not change, if it already exists
-		mkdir data && chmod g+w data || return 13
+		mkdir data || return 13
 	fi
 
-	# move to somewhere else?
-	if [[ ! -e log ]]; then
-		# passenger wanna write its production.log/sidekiq.log  here =8-(
-		# god.log comes from the god-serv service (is relocatable)
-		mkdir log || return 14
-		touch log/production.log
-		chmod g+w log log/production.log
-	fi
-	if [[ ! -e ~/log ]]; then
-		mkdir ~/log && chmod g+w ~/log
-	fi
+	# passenger wanna write its {production|development|sidekiq}.log  here
+	# but the build and whatever else as well  =8-(
+	[[ -e log ]] || { mkdir log || return 14 ; }
+	[[ ${BRANCH} == 'production' || ${BRANCH} == 'staging' ]] && \
+		X='production' || X='development'
+	touch log/${X}.log
+	# god.log comes from the god-serv service (is relocatable)
+	[[ ! -e ~/log ]] && mkdir ~/log
+	chmod g+w data log log/${X}.log ~/log
+
+	# don't call dangerous scripts, which may destroy data unintentionally, or
+	# invoke sudo behind the scene, or seem to be simply overhead
+	chmod 0644 script/{install-on-ubuntu,backup,rails} 2>/dev/null
 
 	return 0
 }
@@ -263,6 +273,8 @@ function buildGems {
 	[[ -d ~/bin ]] || mkdir ~/bin
 	[[ -d ~/bin ]] && bundler install --binstubs ~/bin
 
+	X=${ umask ; }
+	umask 022	# allow webservd to update e.g. tmp/cache/*
 	# NOTE: W/o having RAILS_ENV set, it assumes RAILS_ENV=production ...
 	~/bin/rake assets:precompile
 
@@ -271,12 +283,13 @@ function buildGems {
 	ln -sf ../vendor/bundle shared/vendor_bundle
 
 	# tell possibly running passengers to restart
-	[[ -d tmp ]] || { mkdir tmp ; chmod g+w tmp ; }
+	[[ -d tmp ]] || mkdir tmp
 	touch tmp/restart.txt
 
 	# stamp this build
 	print "${CFG[head]}@${CFG[rvers]}@${CFG[gvers]}@${CFG[bvers]}" \
 		>${CFG[dest]}/VERSION
+	umask $X
 }
 
 function resetDb {
@@ -288,6 +301,8 @@ function resetDb {
 	export RAILS_ENV
 
 	redis-cli flushdb
+	# see http://blog.endpoint.com/2012/10/postgres-system-triggers-error.html
+	#	http://stackoverflow.com/questions/7805558/how-to-disable-triggers-in-postgresql-9
 	if (( HAS_SOLR )); then
 		~/bin/rake db:migrate:reset
 		~/bin/rake sunspot:solr:start

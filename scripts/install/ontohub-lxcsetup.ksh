@@ -127,9 +127,11 @@ function postRuby {
 	# real production env. Proper packages should be used instead!
 	# Anyway, russian roulette starts:
 	###########################################################################
+	Log.info "$0 setup ..."
 	Log.warn "$0 TBD: Use real packages!"
 
 	typeset X RB_PROFILE="${RBENV_ROOT}/.profile" \
+	postInit || return $?
 	
 	X="[[ -r ${RB_PROFILE} ]] && . ${RB_PROFILE}" 
 	print "$X" >>~ruby/.profile
@@ -174,7 +176,7 @@ eval "$(rbenv init -)"' >${RB_PROFILE}
 	X+='passenger-install-apache2-module -a --languages=ruby'
 	print "$X" >/tmp/pi.$$
 	/bin/su - ruby -c "ksh93 /tmp/pi.$$"
-	Log.info 'Passenger done.' && sleep 20
+	Log.info 'Passenger done.'
 	# TBD: check the alternative:
 	#print "deb https://oss-binaries.phusionpassenger.com/apt/passenger" \
 	#	"${LNX_CODENAME} main" >/etc/apt/sources.list.d/passenger.list
@@ -221,11 +223,13 @@ EOF
 }
 
 function postSolr {
-	(( HAS_SOLR )) || return
+	postInit || return $?
+	(( HAS_SOLR )) || return 0
+
+	Log.info "$0 setup ..."
 	typeset X SOLRBASE='http://apache.openmirror.de/lucene/solr' \
 		REPO_SCONF=~ontohub/ontohub/solr/conf
 
-	Log.info "Tomcat solr setup ..."
 	# deploy solr on tomcat (~150 MB archive + 0.5 MB the extracted solr.war)
 	[[ ! -d ${SITEDIR}/tmp ]] && mkdir -p ${SITEDIR}/tmp
 	cd ${SITEDIR}/tmp  || return 1
@@ -247,8 +251,7 @@ function postSolr {
 	# TBD: This is dangerous/works as long as the webapp doesn't get redeployed
 	ln -sf ${REPO_SCONF} /var/lib/tomcat7/webapps/solr/conf
 	chmod 0755 /var/log/tomcat7			# 0750 is too paranoid
-
-	Log.info "Tomcat solr setup done."
+	Log.info "$0 done."
 }
 
 X="${SDIR}/oh-update.sh"
@@ -258,21 +261,19 @@ if [[ ! -e $X ]]; then
 	[[ $X == '#!/bin/ksh93' ]] || rm -f ${SDIR}/oh-update.sh
 fi
 X="${ZROOT}/local/home/admin/etc/"
+URL='https://raw.githubusercontent.com/ontohub/admin-scripts/master/scripts/install/oh-update.sh'
 mkdir -p $X
 [[ -e ${SDIR}/oh-update.sh ]] && \
 	sed -e "/^CFG\[datadir\]=/ s,=.*,='${DATADIR[git].z_dir}'," \
 		${SDIR}/oh-update.sh >$X/oh-update.sh || \
-	print 'echo Fetch $0 from http://iws.cs.ovgu/~elkner/ubuntu/oh-update.sh' \
-		'and run it.' >$X/oh-update.sh
+	print "echo Fetch $0 from '${URL}' and run it." >$X/oh-update.sh
 chmod 0755 $X/oh-update.sh
 
 function postOntohub {
+	postInit || return $?
 	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub X DB RAILS_ENV
 
-	if [[ -z ${BRANCH} ]]; then
-		X=$(<~ontohub/ontohub/.git/HEAD)
-		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
-	fi
+	Log.info "$0 setup ..."
 	if [[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]]; then
 		X='-P'
 		DB='ontohub'
@@ -340,8 +341,9 @@ fi
 }
 
 function postDb {
-	Log.info "$0 setup ..."
+	postInit || return $?
 
+	Log.info "$0 setup ..."
 	service redis-server stop
 	sed -e "/^dir / s,^.*,dir ${REDISDIR}," -i /etc/redis/redis.conf
 	service redis-server start
@@ -350,10 +352,6 @@ function postDb {
 
 	typeset X=${ pg_config --bindir ; } Y Z DB SQL
 
-	if [[ -z ${BRANCH} ]]; then
-		X=$(<~ontohub/ontohub/.git/HEAD)
-		[[ $X =~ '/' ]] && BRANCH="${X##*/}"
-	fi
 	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && DB='ontohub' \
 		|| DB='ontohub_development,ontohub_test'
 
@@ -413,6 +411,8 @@ grant all on database '"$Y"' to ontohub;
 }
 
 function postApache {
+	postInit || return $?
+
 	Log.info "$0 setup ..."
 	service apache2 stop
 
@@ -826,21 +826,20 @@ EOF
 
 	# context apps do not work dueto bogus passenger (4.x)
 #	sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE%/public}, }" \
-#		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
-#		-e "/PassengerAppEnv/ s,production,${RENV}," \
 #		-i ${SITECF}
 
 	# so map the app completely to /
 	sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
 		-e "/^<Directory .*\/htdocs\"?/ s,^.*,<Directory \"${APPBASE}\">," \
 		-e '/^DocumentRoot/,/^<\/Directory>/ s,\+MultiViews,-MultiViews +SymLinksIfOwnerMatch,' \
-		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
 		-i ${SITECF}
 
-	# hardcoded into lib/capistrano/tasks/maintenance.cap and
-	# git/lib/git_shell.rb - prefer to have it in the main config: instead of a
-	# .htaccess somewhere in the wild
-	sed -r -e '/^DocumentRoot/ {
+	# maintenance.txt is hardcoded into lib/capistrano/tasks/maintenance.cap and
+	# git/lib/git_shell.rb - prefer to have the rewrite rules in the main config
+	# instead of a .htaccess somewhere in the wild
+	sed -e "/PassengerAppEnv/ s,production,${RENV}," \
+		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
+		-e '/^DocumentRoot/ {
 a\
 <Location /> \
 	# no trailing slashes \
@@ -855,10 +854,13 @@ a\
 	chown -R ontohub:webservd ${SITEDIR}
 
 	service apache2 start
-	Log.info "$0 setup ..."
+	Log.info "$0 setup done."
 }
 
 function postGit {
+	#postInit || return $?
+
+	Log.info "$0 setup ..."
 	Log.warn "$0: TBD"
 	# see config/initializers/paths.rb , app/models/repository/symlink.rb ,
 	# lib/tasks/databases.rake -> 'repositories', 'git_daemon' and 'commits'
@@ -903,6 +905,22 @@ function normalizeRubyVersion {
 	print "${F// /.}"
 }
 
+function postInit {
+	(( INIT )) && return 0
+	[[ -d ~ontohub/ontohub ]] || return 1
+	
+	# let this file dictate the ruby version to install - anyway, it is so
+	# hard to write down the correct version number ... - muhhh
+	typeset X=${ normalizeRubyVersion ~ontohub/ontohub/.ruby-version ; }
+	[[ -n $X ]] && RUBY_VERS="$X"
+	grep -q _solr ~ontohub/ontohub/Gemfile && HAS_SOLR=1
+	Log.info "Using ruby version '${RUBY_VERS}'."
+	RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"
+	X=$(<~ontohub/ontohub/.git/HEAD)
+	[[ $X =~ '/' ]] && BRANCH="${X##*/}"
+	INIT=1
+}
+
 function postInstall {
 	Log.info "Running $0 ..."
 	typeset F X PKGS='redis-server hets-server-core'
@@ -923,17 +941,9 @@ function postInstall {
 	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && X+=' -P'
 	# pull/checkout to get the needed ruby version
 	su - ontohub -c "~admin/etc/oh-update.sh $X -u" 
-	grep -q _solr ${ZROOT}/local/home/ontohub/ontohub/Gemfile && HAS_SOLR=1
+	postInit || return $?	# because this may change pkg selection
 	(( HAS_SOLR )) && PKGS+=' tomcat7 tomcat7-admin'
 
-	# let this file dictate the ruby version to install - anyway, it is so
-	# hard to write down the correct version number ... - muhhh
-	X=${ normalizeRubyVersion ~ontohub/ontohub/.ruby-version ; }
-	[[ -n $X ]] && RUBY_VERS="$X"
-	Log.info "Using ruby version '${RUBY_VERS}'."
-
-	RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"
- 
 	# hets and tomcat need JRE, which in turn needs a running zone (pkg assembly
 	# issue). redis-server does not, but putting it here saves an additional
 	# apt-get install ...
@@ -962,11 +972,11 @@ FN=' normalizeRubyVersion'
 for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=" $X" ; done
 
 ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\n' 
-ZSCRIPT+='integer JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
+ZSCRIPT+='integer INIT=0 JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
 ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
 	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS RUBY_VERS RBENV_ROOT \
 	GITDATA BRANCH HAS_SOLR ; }\n"
-ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInstall\n'
+ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInit\n'
 ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"
 ZSCRIPT+='#typeset -ft ${ typeset +f ; }\n\n'
 X="${FN// /|}"
