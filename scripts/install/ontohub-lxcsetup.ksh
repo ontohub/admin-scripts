@@ -2,6 +2,8 @@
 
 # see https://github.com/ontohub/ontohub/wiki/Productive-Deployment
 # https://github.com/ontohub/ontohub/wiki/Our-productive-configuration
+# NOTE: passenger 4.0.53 and .40 (other versions not tested) seem to not work
+#       in environments where real concurrency occures/LXC zones 
 
 SDIR=$( cd ${ dirname $0; }; printf "$PWD" )
 MAC_PREFIX=0:80:41
@@ -86,6 +88,7 @@ addPkg install	apache2 apache2-utils	# web frontend
 addPkg install	postgresql				# DB
 addPkg install	ca-certificates			# let git work correctly
 addPkg install	git						# ontology repo management
+addPkg install	fonts-liberation		# includes best non-prop. font ever seen
 # hours of work: ruby does not say, that it needs readline, but actually
 # compiling without it will give a lot of headaches ('gem install rb-readline'
 # is NOT a workaround).
@@ -116,10 +119,27 @@ checkDatadirsPost
 
 
 # To avoid a chroot marathon we simply xfer the following functions as script
-# into the zone and run it there.
+# as well as supporting scripts into the zone and run it there.
+URL='https://raw.githubusercontent.com/ontohub/admin-scripts/master/scripts/install/'
+for X in passenger.patch oh-update.sh hashCerts ; do
+	if [[ ! -f ${SDIR}/$X && $X != 'passenger.patch' ]]; then
+		curl -O ~admin/etc/$X ${URL}$X
+		read -n 12 X <~admin/etc/$X
+		[[ $X == '#!/bin/ksh93' ]] || rm -f ~admin/etc/$X
+	fi
+	if [[ ! -f ~admin/etc/$X ]]; then
+		[[ $X == 'passenger.patch' ]] && continue	# not in repo
+		print "echo Fetch $0 from '${URL}/$X' and run it." \
+			>${ZROOT}/local/home/admin/etc/$X
+	else
+		cp ${SDIR}/$X ${ZROOT}/local/home/admin/etc/$X
+		[[ $X == 'oh-update.sh' ]] && \
+			sed -e "/^CFG\[datadir\]=/ s,=.*,='${DATADIR[git].z_dir}'," \
+				-i ${ZROOT}/local/home/admin/etc/$X
+	fi
+	chmod 0755 ${ZROOT}/local/home/admin/etc/$X
+done
 
-[[ -f ${SDIR}/passenger.patch ]] && \
-	cp ${SDIR}/passenger.patch ${ZROOT}/local/home/admin/etc/
 
 function postRuby {
 	###########################################################################
@@ -253,21 +273,6 @@ function postSolr {
 	chmod 0755 /var/log/tomcat7			# 0750 is too paranoid
 	Log.info "$0 done."
 }
-
-X="${SDIR}/oh-update.sh"
-if [[ ! -e $X ]]; then
-	curl -o $X http://iws.cs.ovgu/~elkner/ubuntu/oh-update.sh
-	read -n 12 X <$X
-	[[ $X == '#!/bin/ksh93' ]] || rm -f ${SDIR}/oh-update.sh
-fi
-X="${ZROOT}/local/home/admin/etc/"
-URL='https://raw.githubusercontent.com/ontohub/admin-scripts/master/scripts/install/oh-update.sh'
-mkdir -p $X
-[[ -e ${SDIR}/oh-update.sh ]] && \
-	sed -e "/^CFG\[datadir\]=/ s,=.*,='${DATADIR[git].z_dir}'," \
-		${SDIR}/oh-update.sh >$X/oh-update.sh || \
-	print "echo Fetch $0 from '${URL}' and run it." >$X/oh-update.sh
-chmod 0755 $X/oh-update.sh
 
 function postOntohub {
 	postInit || return $?
@@ -455,6 +460,16 @@ function postApache {
 	# damn: and this as well
 	[[ -e ${CFDIR}/apache2.conf ]] || ln -s httpd.conf ${CFDIR}/apache2.conf
 
+	# pure convinience
+	[[ -d /var/www/cgi-bin ]] || mkdir /var/www/cgi-bin
+	if [[ ! -x /var/www/cgi-bin/printenv ]]; then
+		print '#!/bin/ksh93
+print "Content-type: text/plain; charset=UTF-8\n\n"
+set
+'			>/var/www/cgi-bin/printenv
+		chmod 0755 /var/www/cgi-bin/printenv
+	fi
+
 	# the common "minimal" set for all httpd servers
 	[[ -e ${CFDIR}/httpd.conf ]] || cat>${CFDIR}/httpd.conf<<EOF
 # For more information have a look at the default config file
@@ -483,6 +498,7 @@ LoadModule	auth_basic_module		modules/mod_auth_basic.so
 LoadModule	authn_core_module		modules/mod_authn_core.so
 LoadModule	authz_core_module		modules/mod_authz_core.so
 LoadModule	authz_host_module		modules/mod_authz_host.so
+LoadModule	reqtimeout_module		modules/mod_reqtimeout.so
 
 User		\${APACHE_RUN_USER}
 Group		\${APACHE_RUN_GROUP}
@@ -521,6 +537,17 @@ ServerSignature		on
 HostnameLookups		on
 Mutex				file:\${APACHE_LOCK_DIR} default
 
+<IfModule reqtimeout_module>
+	# Format: time to wait for the 1st byte in seconds, rate in Bytes per second
+	RequestReadTimeout header=20-40,minrate=500
+	RequestReadTimeout body=10,minrate=500
+</IfModule>
+
+<IfModule setenvif_module>
+	# all other defaults refer to ancient software no-one should use anymore
+	BrowserMatch	" Konqueror/4" redirect-carefully
+</IfModule>
+
 DirectoryIndex index.html index.html.var
 
 <FilesMatch "^\.ht">
@@ -549,7 +576,7 @@ ScriptAlias /cgi-bin/ "/var/www/cgi-bin/"
 <Directory "/var/www/cgi-bin">
 	AddHandler cgi-script .cgi
 	AllowOverride None
-	Options None
+	Options +SymLinksIfOwnerMatch
 	Require all granted
 </Directory>
 
@@ -632,9 +659,116 @@ Include ${SITECF%/*}/extern.conf
 # vim: syntax=apache ts=4 sw=4 sts=4 sr noet
 EOF
 
+	X=${CFDIR}/sites/pass
+	if [[ ! -x $X ]]; then
+		print '#!/bin/sh\necho unattended_boot_allows_now_pass' >$X
+		chown webadm:webservd $X
+		chmod 0770 $X
+	fi
+	for X in crt key ; do
+		[[ ! -d ${CFDIR}/ssl.$X ]] && mkdir ${CFDIR}/ssl.$X
+		chown webadm:webservd ${CFDIR}/ssl.$X
+		[[ $X == 'key' ]] && ADD=0750 || ADD=0755
+		chmod ${ADD} ${CFDIR}/ssl.$X
+	done
+	X=${CFDIR}/ssl.crt/hashCerts
+	[[ ! -x $X ]] && cp -p ~admin/etc/hashCerts $X && chmod 0755 $X
+	if [[ ! -e ${CFDIR}/ssl.crt/server.crt ]]; then
+		ln -s /etc/ssl/private/ssl-cert-snakeoil.key ${CFDIR}/ssl.key/server.key
+		ln -s /etc/ssl/certs/ssl-cert-snakeoil.pem ${CFDIR}/ssl.crt/server.crt
+	fi
+	${CFDIR}/ssl.crt/hashCerts
+
+	print '# Basic/common SSL configuration
+<IfModule !ssl_module>
+	LoadModule	ssl_module				modules/mod_ssl.so
+</IfModule>
+<IfModule !socache_shmcb_module>
+	LoadModule	socache_shmcb_module	modules/mod_socache_shmcb.so
+</IfModule>
+SSLRandomSeed			startup file:/dev/urandom 512
+SSLRandomSeed			connect file:/dev/urandom 512
+SSLPassPhraseDialog		exec:'"${CFDIR}"'/sites/pass
+
+SSLSessionCache			shmcb:${APACHE_RUN_DIR}/ssl_scache(512000)
+SSLSessionCacheTimeout	300
+Mutex					sem
+#SSLCipherSuite			ALL:!ADH:!kEDH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
+# taken AS IS from original
+SSLCipherSuite			EECDH+AES:AES128-GCM-SHA256:HIGH:!MD5:!aNULL:!EDH
+SSLHonorCipherOrder		on
+#SSLVerifyClient		require
+#SSLVerifyDepth			5
+SSLCertificateFile		'"${CFDIR}"'/ssl.crt/server.crt
+SSLCertificateKeyFile	'"${CFDIR}"'/ssl.key/server.key
+SSLCACertificatePath	'"${CFDIR}"'/ssl.crt
+# taken AS IS from original
+SSLProtocol				all -SSLv2
+
+AddType application/x-x509-ca-cert	.crt
+AddType application/x-pkcs7-crl		.crl
+
+<FilesMatch "\.(cgi|shtml|phtml|php)$">
+	SSLOptions +StdEnvVars
+</FilesMatch>
+<Directory "/var/www/cgi-bin">
+	SSLOptions +StdEnvVars
+</Directory>
+
+LogFormat	"%h %{%F %T %z}t %X %I %O %B %D %{SSL_PROTOCOL}x %{SSL_CIPHER}x %u %>s \"%r\" \"%{Referer}i\" \"%{User-Agent}i\"" extendedssl
+CustomLog	"|/usr/bin/rotatelogs ${APACHE_LOG_DIR}/%Y%m%d-%H%M%S-access.log 2592000" extendedssl env=SSL_PROTOCOL
+
+# vim: ts=4 filetype=apache
+'	>${CFDIR}/ssl.conf
+
+	[[ -e ${CFDIR}/mime.types.extensions ]] || \
+		cat>${CFDIR}/mime.types.extensions<<EOF
+# Default icons come from /icons/* usually used by fancy indexing (20x22px)
+AddDescription "Server Side Include file" .shtml
+AddType text/html .shtml
+
+AddDescription "Adobe Portable Document Format" .pdf
+AddIcon /icons/pdf.gif .pdf
+
+AddDescription "Eclipse classpath configuration file" .classpath
+AddDescription "Eclipse project configuration file" .project
+AddDescription "CVS configuration file for pathes to ignore" .cvsignore
+AddDescription "Ant build properties customization file" build.properties
+AddDescription "Ant build file" build.xml
+AddType text/xml .classpath .project .xml
+AddIcon /icons/screw1.gif .classpath .cvsignore .project .properties build.xml
+
+AddDescription "Java Archive" .jar
+AddType application/x-java-archive .jar
+AddDescription "Java Network Lunch Protocol Application" .jnlp
+AddType application/x-java-jnlp-file .jnlp
+AddDescription "Java Archive Diff" .jardiff
+AddType application/x-java-archive-diff .jardiff
+
+AddDescription "tar archive" .tar
+AddDescription "GZIP compressed archive" .gz
+AddDescription "GZIP compressed tar archive" .tgz
+AddType application/x-gzip .gz .tgz
+
+AddDescription "Z compressed archive" .Z
+AddType application/x-compress .Z
+
+AddDescription "Bzip2 compressed archive" .bz2
+AddType application/x-bzip2 .bz2
+AddIcon /icons/compressed.gif .bz2
+
+AddDescription "Proxy Auto Configuration file" .pac
+AddType application/x-ns-proxy-autoconfig .pac
+AddIcon /icons/world2.gif .pac
+
+# vim: ts=4 filetype=apache
+EOF
 
 	# the common set for all sites hosted on this server
 	[[ -e ${SITECF%/*}/extern.conf ]] || cat>${SITECF%/*}/extern.conf<<EOF
+#Include ${CFDIR}/ssl.conf
+Include ${CFDIR}/mime.types.extensions
+
 <IfModule !status_module>
 	LoadModule	status_module		modules/mod_status.so
 	LoadModule	info_module			modules/mod_info.so
@@ -731,6 +865,12 @@ ErrorLog	\${APACHE_LOG_DIR}/@NODENAME@.@DOMAIN@/error.log
 #	PassengerDebugLogFile \${APACHE_LOG_DIR}/@NODENAME@.@DOMAIN@/passenger.log
 ##	PassengerLogLevel 7
 #	PassengerAppEnv production
+## taken AS IS from the original config
+##	Header always unset "X-Powered-By"
+##	Header always unset "X-Runtime"
+#	SetEnv RUBY_GC_MALLOC_LIMIT 59000000
+#	SetEnv RUBY_GC_HEAP_FREE_SLOTS 600000
+#	SetEnv RUBY_GC_HEAP_INIT_SLOTS 100000
 #</IfModule>
 
 <IfModule rewrite_module>
@@ -759,6 +899,9 @@ DocumentRoot ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/htdocs
 	Options +Indexes +Includes +MultiViews
 	Require all granted
 </Directory>
+
+# see ../httpd.conf
+ScriptAlias /cgi-bin/printenv /var/www/cgi-bin/printenv
 
 ScriptAlias	/cgi-bin/ ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin/
 <Directory "${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin">
@@ -792,22 +935,16 @@ ScriptAlias	/cgi-bin/ ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin/
 #</Directory>
 
 #<IfModule ssl_module>
-#	SSLCertificateFile ${CFDIR}/conf/ssl.crt/@NODENAME@.@DOMAIN@.crt
+#	SSLCertificateFile ${CFDIR}/ssl.crt/@NODENAME@.@DOMAIN@.crt
 #	SSLCertificateKeyFile ${CFDIR}/ssl.key/@NODENAME@.@DOMAIN@.key
 #</IfModule>
 
 # vim: ts=4 filetype=apache
 EOF
 
-	[[ -e ${SITECF} ]] || \
-		sed -e "s,@NODENAME@,${ZNAME},g" -e "s,@DOMAIN@,${ZDOMAIN},g" \
-			${SITECF%/*}/template.conf >${SITECF}
-
 	[[ ! -d ${SITEDIR}/htdocs ]] && mkdir -p ${SITEDIR}/htdocs
 	[[ ! -d ${SITEDIR}/cgi-bin ]] && mkdir -p ${SITEDIR}/cgi-bin
 	[[ ! -d ${SITEDIR}/etc ]] && mkdir -p ${SITEDIR}//etc
-
-	chown -R webadm:staff ${SITEDIR}
 
 	(	# avoid possible side effects
 		. /etc/apache2/envvars
@@ -817,29 +954,34 @@ EOF
 			mkdir -p ${APACHE_LOG_DIR}/${ZNAME}.${ZDOMAIN}
 	)
 
-	# ontohub specials
-	typeset APPBASE='/local/home/ontohub/ontohub/public' APPNAME='ruby' \
-		RENV='development'
-	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && RENV='production'
-	
 	sed -e '/passenger.conf/ s,^#,,' -i ${SITECF%/*}/extern.conf
 
-	# context apps do not work dueto bogus passenger (4.x)
-#	sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE%/public}, }" \
+	if [[ ! -e ${SITECF} ]]; then
+		sed -e "s,@NODENAME@,${ZNAME},g" \
+			-e "s,@DOMAIN@,${ZDOMAIN},g" ${SITECF%/*}/template.conf >${SITECF}
+
+		# ontohub specials
+		typeset APPBASE='/local/home/ontohub/ontohub/public' APPNAME='ruby' \
+			RENV='development'
+		[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && \
+			RENV='production'
+	
+		# context apps do not work dueto bogus passenger (4.x)
+#		sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE%/public}, }" \
 #		-i ${SITECF}
 
-	# so map the app completely to /
-	sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
-		-e "/^<Directory .*\/htdocs\"?/ s,^.*,<Directory \"${APPBASE}\">," \
-		-e '/^DocumentRoot/,/^<\/Directory>/ s,\+MultiViews,-MultiViews +SymLinksIfOwnerMatch,' \
-		-i ${SITECF}
+		# so map the app completely to /
+		sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
+			-e "/^<Directory .*\/htdocs\"?/ s,^.*,<Directory \"${APPBASE}\">," \
+			-e '/^DocumentRoot/,/^<\/Directory>/ s,\+MultiViews,-MultiViews +SymLinksIfOwnerMatch,' \
+			-i ${SITECF}
 
-	# maintenance.txt is hardcoded into lib/capistrano/tasks/maintenance.cap and
-	# git/lib/git_shell.rb - prefer to have the rewrite rules in the main config
-	# instead of a .htaccess somewhere in the wild
-	sed -e "/PassengerAppEnv/ s,production,${RENV}," \
-		-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
-		-e '/^DocumentRoot/ {
+		# maintenance.txt is hardcoded into lib/capistrano/tasks/maintenance.cap
+		# and git/lib/git_shell.rb - prefer to have the rewrite rules in the
+		# main config instead of a .htaccess somewhere in the wild
+		sed -e "/PassengerAppEnv/ s,production,${RENV}," \
+			-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
+			-e '/^DocumentRoot/ {
 a\
 <Location /> \
 	# no trailing slashes \
@@ -849,9 +991,26 @@ a\
 	RewriteCond %{DOCUMENT_ROOT}/../data/maintenance.txt -f \
 	RewriteRule .* /503.html [R=503,L] \
 </Location>
-}'		-i ${SITECF}
+}'			-i ${SITECF}
 
-	chown -R ontohub:webservd ${SITEDIR}
+		print '
+# taken AS IS from the original
+<IfModule deflate_module>
+	<IfModule mod_filter.c>
+		# these are known to be safe with MSIE 6
+		AddOutputFilterByType DEFLATE text/html text/plain text/xml
+
+		# everything else may cause problems with MSIE 6
+		AddOutputFilterByType DEFLATE text/css
+		AddOutputFilterByType DEFLATE application/x-javascript application/javascript application/ecmascript
+		AddOutputFilterByType DEFLATE application/rss+xml
+	</IfModule>
+</IfModule>
+'			>>${SITECF}
+	fi
+
+	chown -R webadm:staff ${SITEDIR}
+	#chown -R ontohub:webservd ${SITEDIR}
 
 	service apache2 start
 	Log.info "$0 setup done."

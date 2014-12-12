@@ -1,0 +1,69 @@
+#!/bin/ksh93
+
+typeset -r FPROG=${.sh.file}
+typeset -r PROG=${FPROG##*/}
+SDIR=${.sh.file} && SDIR=${SDIR%/*} && [[ ${SDIR} == ${.sh.file} ]] && \
+	SDIR=${PWD}
+
+function showUsage {
+	getopts -a ${PROG} "${ print ${USAGE}; }" OPT --man
+}
+
+function doMain {
+	typeset OPENSSL=${ whence openssl; } F LSI DST FMT HASH
+	[[ -z ${OPENSSL} || ! -x ${OPENSSL} ]] && \
+		print -u2 "openssl program not found - exiting." && exit 1
+	cd "${SDIR}" || return 1
+
+	# remove old stuff
+	for F in ~(N)[0-9a-fA-F]*.[0-9]*; do
+		[[ ! -L $F ]] && continue
+		LSI=( ${ ls -l $F ; } )
+		DST=${LSI[10]}
+		[[ -z ${DST} || ${DST##*.} != 'crt' ]] && continue
+		rm -f $F
+	done
+
+	# re-create links
+	integer N
+	FMT="%-15s ... %s\n"
+	for F in ~(N)*.crt; do
+		[[ ! -e $F ]] && continue
+		grep -q SKIPME $F		# magic hint
+		(( $? == 0 )) && printf "${FMT}" "$F" 'Skipped' && continue
+		N=0
+		while (( N < 256 )); do
+			HASH=${ ${OPENSSL} x509 -noout -hash < ${F}; }
+			[[ -r ${HASH}.$N ]] && (( N++ )) && continue
+			printf "${FMT}" "$F" "${HASH}.$N"
+			ln -s "./$F" "${HASH}.$N"
+			break
+		done
+	done
+}
+
+USAGE='[-?$Id$ ]
+[-copyright?Copyright (c) 2013 Jens Elkner. All rights reserved.]
+[-license?CDDL 1.0]
+[+NAME?'"${PROG}"' - update SSL certificate hashes for OpenSSL]
+[+DESCRIPTION?Remove old openssl hash symbolic links to *.crt files and re-create them in the target directory.]
+[h:help?Print this help and exit.]
+[F:functions?Print out a list of all defined functions. Just invokes the \btypeset +f\b builtin.]
+[T:trace]:[fname_list?A comma or whitspace separated list of function names, which should be traced during execution.]
+[+?]
+[d:dir]:[path?Target directory containing the certs to hash. Default: The directory, which contains this script ('"${SDIR}"').]
+[+SEE ALSO?\bopenssl\b(1)]
+'
+X="${ print ${USAGE} ; }"
+while getopts "$X" OPT ; do
+	case "${OPT}" in
+		h) showUsage ; exit 0 ;;
+		F) typeset +f ; exit 0 ;;
+		T) typeset -ft ${OPTARG//,/ } ;;		
+		d) SDIR="${OPTARG}" ;;
+	esac
+done
+X=$((OPTIND-1))
+shift $X
+
+doMain "$@"

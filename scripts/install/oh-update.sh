@@ -4,6 +4,9 @@ unset CFG LC_ALL LANG LANGUAGE
 
 MY_ORG="© 2012-${ date +%Y ; } Universität Magdeburg and Universität Bremen"
 MY_NAME='Ontohub'
+# If unset, local sendmail delivery will be used, otherwise direct smtp gets
+# configured, i.e. talk directly non-STARTTLS SMTP to ${MAIL_GW} on port 25
+MAIL_GW='mail'
 
 typeset -A CFG
 export LC_CTYPE=C LC_MESSAGES=C LC_COLLATE=C LC_TIME=C GIT=${ whence git ; }
@@ -120,12 +123,13 @@ function updateRepo {
 			if [[ ${CFG[branch]} == 'staging' ]]; then
 				MY_NAME+=' β'
 			elif [[ ${CFG[branch]} != 'master' ]]; then
-				MY_NAME+=' Γ'
+				MY_NAME+=' α'
 			fi
 			X='@'
 			[[ ${BRANCH} != 'production' && ${HNAME#*.} == 'ontohub.org' ]] && \
-				HNAME="${HNAME%%.*}.iws.cs.ovgu.de" && X="+oh-${HNAME%%$.*}@"
+				HNAME="${HNAME%%.*}.iws.cs.ovgu.de" && X="+oh-${HNAME%%.*}@"
 			Y=${HNAME#*.}
+			[[ -n ${MAIL_GW} ]] && OUT='smtp' || OUT='sendmail' 
 			sed -e "/^hostname:/ s,:.*,: ${HNAME}," \
 				-e "/^email:/ s,:.*,: noreply${X}${Y}," \
 				-e "/^fallback_commit_email:/ s,:.*,: ontohub_system${X}${Y}," \
@@ -135,7 +139,20 @@ function updateRepo {
 				-e "s,ontohub exception,ontohub ex," \
 				-e "/^name:/ s,:.*,: '${MY_NAME}'," \
 				-e "/text: Foo Institute/ s,:.*,: ${MY_ORG}," \
+				-e "/^[[:space:]]*delivery_method:/ s,:.*,: ${OUT}," \
 				-i config/settings.yml
+			# delivery_method setting in config/settings.yml seems to be useless
+			X='\
+	config.action_mailer.default_url_options = { :host => '"'${HNAME}'"' }\
+	config.action_mailer.delivery_method = :smtp\
+	config.action_mailer.smtp_settings = {\
+		:address				=> "'"${MAIL_GW:-mail}"'",\
+		:port					=> 25,\
+		:enable_starttls_auto	=> false,\
+		:domain					=> '"'${HNAME}'"'\
+	}'
+			sed -e "/= APP_CONFIG =/ a\  ${X}" \
+				-e '/# ActionMailer/,/end/ { N;d }' -i config/application.rb
 		fi
 
 		# for cookie encryption
@@ -274,7 +291,7 @@ function buildGems {
 	[[ -d ~/bin ]] && bundler install --binstubs ~/bin
 
 	X=${ umask ; }
-	umask 022	# allow webservd to update e.g. tmp/cache/*
+	umask 002	# allow webservd to update e.g. tmp/cache/*
 	# NOTE: W/o having RAILS_ENV set, it assumes RAILS_ENV=production ...
 	~/bin/rake assets:precompile
 

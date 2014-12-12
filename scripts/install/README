@@ -1,0 +1,12 @@
+Admin scripts used @iws.cs.uni-magdeburg.de to manage LXC containters (zones)/
+ontohub instances:
+ - Usually all scripts require AT&T ksh93 (buggy/incompatible implementations
+   like mksh, pdksh, etc. will not work and may cause damage to your system)
+ - Provided on a sink or swim base! Test before using it on production systems!
+ - *-lxcsetup.ksh: zone setup scripts
+ - *.kshlib: ksh93 functions to avoid boilerplate code
+ - lxc-ubuntu-csmd: our default zone template to use with lxc-create(1)
+   When copied to /usr/share/lxc/templates/ one may use the short version
+   when calling lxc-create (-t ubuntu-csmd), otherwise one has to supply the
+   full path to the template
+ - everything else: see $script -h
