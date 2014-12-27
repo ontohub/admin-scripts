@@ -7,6 +7,10 @@ MY_NAME='Ontohub'
 # If unset, local sendmail delivery will be used, otherwise direct smtp gets
 # configured, i.e. talk directly non-STARTTLS SMTP to ${MAIL_GW} on port 25
 MAIL_GW='mail'
+# the a priori default 'staging' is dead meat, so we need to set it explicitly
+DEFAULT_BRANCH='staging.ontohub.org'
+# The port the web application should use (the httpd proxy connects to)
+WEBAPP_PORT=3000
 
 typeset -A CFG
 export LC_CTYPE=C LC_MESSAGES=C LC_COLLATE=C LC_TIME=C GIT=${ whence git ; }
@@ -70,17 +74,20 @@ function updateRepo {
 	# clone if not already done
 	if [[ ! -d ${CFG[repo]} ]]; then
 		${GIT} clone ${CFG[url]} ${CFG[repo]##*/} || return 3
+		[[ -z ${CFG[branch]} ]] && CFG[branch]="${DEFAULT_BRANCH}"
 		PULL=0
 	fi
 
-	[[ ! -d ${CFG[repo]}/.git/refs ]] && Log.fatal "'${CFG[repo]}' exists" \
-		'but it does not seem to be a git repository.' && return 3
 	cd "${CFG[repo]}" || return 4
-
-	if [[ -f .git/HEAD ]]; then
-		OUT=$(<.git/HEAD)
-		[[ ${OUT} =~ "/" ]] && OUT="${OUT##*/}" || OUT=''
+	[[ -f .git/HEAD ]] && OUT=$(<.git/HEAD)
+	if [[ ${OUT} =~ "/" ]]; then
+		OUT="${OUT##*/}"
+	else
+		Log.fatal "'${PWD}' exists but it does not seem to be a git repository."
+		return 3
 	fi
+	[[ ${CFG[prod]} == '1' || ${OUT} =~ ^(master|staging)(\.ontohub\.org)?$ ]] \
+		&& CFG[renv]='production' || CFG[renv]='development'
 
 	if [[ -n ${CFG[branch]} && ${OUT} != ${CFG[branch]} ]]; then
 		Log.info "Switching branch from '${OUT}' to '${CFG[branch]}' ..."
@@ -119,24 +126,33 @@ function updateRepo {
 			B=( ${A[I]//./ } )
 			(( ${#B[@]} > 1 )) && HNAME="${A[I]}" && break
 		done
+		sed -e "/^source / a\gem 'puma'" -i Gemfile && rm Gemfile.lock
 		if [[ -n ${HNAME} ]]; then
-			if [[ ${CFG[branch]} == 'staging' ]]; then
-				MY_NAME+=' β'
-			elif [[ ${CFG[branch]} != 'master' ]]; then
-				MY_NAME+=' α'
-			fi
+			case "${CFG[branch]}" in
+				master)					MY_NAME+=' dead' ;;
+				ontohub.org)			;;
+				staging)				MY_NAME+=' dead β' ;;
+				staging.ontohub.org)	MY_NAME+=' β' ;;
+				development)			MY_NAME+=' dead α' ;;
+				*)						MY_NAME+=' α' ;;
+			esac
 			X='@'
-			[[ ${BRANCH} != 'production' && ${HNAME#*.} == 'ontohub.org' ]] && \
+			# hook for inofficial zones
+			[[ ${HNAME#*.} == 'ontohub.org' || \
+				! ${ZNAME} =~ ^(www|staging|develop)$ ]] && \
 				HNAME="${HNAME%%.*}.iws.cs.ovgu.de" && X="+oh-${HNAME%%.*}@"
+
 			Y=${HNAME#*.}
 			[[ -n ${MAIL_GW} ]] && OUT='smtp' || OUT='sendmail' 
+			# what a crap:  each branch comes with different defaults
 			sed -e "/^hostname:/ s,:.*,: ${HNAME}," \
-				-e "/^email:/ s,:.*,: noreply${X}${Y}," \
-				-e "/^fallback_commit_email:/ s,:.*,: ontohub_system${X}${Y}," \
-				-e "s,about.example.com,${HNAME}/about/," \
-				-e "s,exceptions@example.com,ontohub${X}${Y}," \
-				-e "s,exception-recipient@example.com,ex${X}${Y}," \
-				-e "s,ontohub exception,ontohub ex," \
+				-e "/^email:/ s,:.*,: noreply@${HNAME}," \
+				-e "/fallback_commit_user:/ s,:.*,: 'webservd',"\
+				-e "/fallback_commit_email:/ s,:.*,: 'ontohub${X}${Y}',"\
+				-e "/\/\/about/ s,about.*,${HNAME}/about/," \
+				-e "/sender_address:/ s,:.*,: webservd@${HNAME}," \
+				-e "/email_prefix:/ s,ontohub.*exception,ontohub ex," \
+				-e "s,exception-recipient@.*,ex${X}${Y}," \
 				-e "/^name:/ s,:.*,: '${MY_NAME}'," \
 				-e "/text: Foo Institute/ s,:.*,: ${MY_ORG}," \
 				-e "/^[[:space:]]*delivery_method:/ s,:.*,: ${OUT}," \
@@ -153,6 +169,10 @@ function updateRepo {
 	}'
 			sed -e "/= APP_CONFIG =/ a\  ${X}" \
 				-e '/# ActionMailer/,/end/ { N;d }' -i config/application.rb
+			# Grrr. All the config stuff is a real big crazy mess.
+			sed -e '/config.action_mailer.default_url_options/ s,c,#c,' \
+				-i config/environments/development.rb
+			sed -e '/^hostname:/ s,^,#,' -i config/settings/development.yml
 		fi
 
 		# for cookie encryption
@@ -166,8 +186,67 @@ function updateRepo {
 		# we have the redirect rules included within the vhosts's httpd config
 		rm -f public/.htaccess
 
-		sed -e '/.development-state/ a\      display: none' \
+		# oh my goodness, this stuff is whitespace sensitive!
+		sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
 			-i app/assets/stylesheets/navbar.css.sass
+	fi
+	if [[ ! -e config/puma.rb ]]; then
+		# For more or less modern, i.e. thread aware impl.s like JRuby or
+		# Rubinius one would probably start with 1 or #CPUs workers,
+		# #STRANDs/#CPUs as #MaxThreads and #MaxThread/4 as #MinThreads per
+		# worker. Unfortunately we currently use MRI (which uses python like
+		# model, i.e. thread == process), and thus threads are useless
+		# => we need heavyweight workers to distribute the load/to be able
+		# to take advantage of the available strands. Note that wrt. current
+		# staging version (2014-12) one worker uses ~275 MiB RAM (RSS)!
+		#
+		# Also note, that - if one uses apache httpd in mpm-worker mode (what
+		# we and usually all smart people do) infront of puma, the number of the
+		# httpd setting 'ThreadsPerChild' is directly related to puma's
+		# #Workers (or for thread aware impl.s to #Worker*#MaxThreads). I.e.
+		# in the apache conf there is exactly one 'ProxyPass*' directive, which
+		# causes a request to be passed to puma. Since each 'ProxyPass*' gets
+		# managed by a single worker, this in turn means, that exactly ONE
+		# apache worker aka process will be used to proxy all related requests.
+		#
+		# And since apache httpd uses for each connection a single thread, it
+		# should be clear, that if 'ThreadsPerChild=24' is set (which is the
+		# default - see http://localhost/server-info?event.c), it is - at least
+		# in our heavy weight scenario - a waste of resources, if we instruct
+		# puma to use more than 24 workers.
+		integer STRANDS=${ nproc ; } THREADS=1 MINTHREADS=1 CPUS
+		if (( 0 )); then
+			CPUS=${ grep 'physical id' /proc/cpuinfo|sort -u|wc -l ; }
+			integer CORES=${ grep 'core id' /proc/cpuinfo|sort -u|wc -l ; }
+			(( THREADS=STRANDS/CPUS ))
+			(( THREADS < 2 )) && THREADS=4
+			(( CPUS < 1 )) && CPUS=1
+			(( MINTHREADS=THREADS/4 ))
+		else
+			(( CPUS=STRANDS*0.75 ))
+		fi
+		X='# see http://www.rubydoc.info/gems/puma/2.10.2/file/README.md\n'
+		X+="environment '${CFG[renv]}'\n"
+		X+="threads ${MINTHREADS},${THREADS}\nworkers ${CPUS}\n"
+		X+="bind 'tcp://0.0.0.0:${WEBAPP_PORT}'\n"
+		[[ ${CFG[renv]} == 'production' ]] && X+='quiet\n'
+		X+='preload_app!
+
+# as suggested by the doc
+on_worker_boot do
+	str = @options[:control_url]
+	if str then
+		uri = URI.parse str
+		if uri.scheme == "unix" then
+			FileUtils.chmod(0770, "#{uri.path}")
+		end
+	end
+	ActiveSupport.on_load(:active_record) do
+		ActiveRecord::Base.establish_connection
+	end
+end
+'
+		print "$X" >config/puma.rb
 	fi
 
 	# "no git.datadir setting" workaround
@@ -191,11 +270,10 @@ function updateRepo {
 		mkdir data || return 13
 	fi
 
-	# passenger wanna write its {production|development|sidekiq}.log  here
-	# but the build and whatever else as well  =8-(
+	# the running webapp wanna write its {production|development|sidekiq}.log
+	# here but the build process and whatever else as well  =8-(
 	[[ -e log ]] || { mkdir log || return 14 ; }
-	[[ ${BRANCH} == 'production' || ${BRANCH} == 'staging' ]] && \
-		X='production' || X='development'
+	X=${CFG[renv]}
 	touch log/${X}.log
 	# god.log comes from the god-serv service (is relocatable)
 	[[ ! -e ~/log ]] && mkdir ~/log
@@ -239,8 +317,7 @@ function buildGems {
 		return 3
 	CFG[bvers]="${A[-1]}"
 
-	[[ -n ${CFG[prod]} ]] && RAILS_ENV='production' || RAILS_ENV='development'
-	export RAILS_ENV
+	export RAILS_ENV=${CFG[renv]}
 
 	[[ ${RAILS_ENV} == 'production' ]] && X='vendor/bundle' || X='../ruby'
 	if [[ -f ${CFG[dest]}/VERSION && -d $X ]]; then
@@ -263,17 +340,27 @@ function buildGems {
 
 	# 1693M
 	if [[ ${RAILS_ENV} == 'production' ]]; then
-		A=( '--deployment'
+		A=(
 			'--without' 'development' 'test' #'deployment'
 		)
+		[[ -f Gemfile.lock ]] && A+=( '--deployment' )
 		# don't show error details on web pages
+		# and avoid the madness what gets called "Logging" in rails (actually
+		# the complete actionpack/lib/action_controller/log_subscriber.rb is
+		# total crap)
 		sed -e '/config.consider_all_requests_local/ s,true,false,' \
+			-e '/config.log_level/ s,^.*,	config.log_level = :warn,' \
 			-i config/environments/production.rb
+		# what the heck ...
+		sed -e '/system / s,-v ,,' -i lib/tasks/sidekiq.rake
 	else
 		unset A
 		# show error details on web pages
+		# and use default "Logging"
 		sed -e '/config.consider_all_requests_local/ s,false,true,' \
+			-e '/config.log_level/ s,^.*,	# config.log_level = :debug,' \
 			-i config/environments/production.rb
+		sed -e '/system / s, -L, -v -L,' -i lib/tasks/sidekiq.rake
 	fi
 	integer JOBS=1
 	[[ ${ uname -s ; } == 'SunOS' ]] && JOBS=${ psrinfo | wc -l ; } || \
@@ -299,10 +386,6 @@ function buildGems {
 	[[ -d shared ]] || mkdir shared
 	ln -sf ../vendor/bundle shared/vendor_bundle
 
-	# tell possibly running passengers to restart
-	[[ -d tmp ]] || mkdir tmp
-	touch tmp/restart.txt
-
 	# stamp this build
 	print "${CFG[head]}@${CFG[rvers]}@${CFG[gvers]}@${CFG[bvers]}" \
 		>${CFG[dest]}/VERSION
@@ -314,8 +397,7 @@ function resetDb {
 
 	Log.info 'Resetting database ...'
 
-	[[ -n ${CFG[prod]} ]] && RAILS_ENV='production' || RAILS_ENV='development'
-	export RAILS_ENV
+	export RAILS_ENV=${CFG[renv]}
 
 	redis-cli flushdb
 	# see http://blog.endpoint.com/2012/10/postgres-system-triggers-error.html
@@ -331,8 +413,6 @@ function resetDb {
 		~/bin/rake db:seed
 		~/bin/rake db:migrate
 	fi
-
-	touch tmp/restart.txt
 }
 
 function doMain {
@@ -366,7 +446,9 @@ function doMain {
 		return 5
 	fi
 
-	[[ -z ${CFG[reset]} ]] && return 0 || resetDb
+	[[ -n ${CFG[reset]} ]] && resetDb
+	# restart the workers aka webApp 
+	[[ -e /tmp/pumactl.sock ]] && ~/etc/puma-serv.sh restart
 }
 
 [[ -n ${BRANCH} ]] && CFG[branch]="${BRANCH}"

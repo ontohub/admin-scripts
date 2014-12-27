@@ -2,8 +2,7 @@
 
 # see https://github.com/ontohub/ontohub/wiki/Productive-Deployment
 # https://github.com/ontohub/ontohub/wiki/Our-productive-configuration
-# NOTE: passenger 4.0.53 and .40 (other versions not tested) seem to not work
-#       in environments where real concurrency occures/LXC zones 
+# http://www.rubydoc.info/gems/puma/2.10.2/frames	http://puma.io/
 
 SDIR=$( cd ${ dirname $0; }; printf "$PWD" )
 MAC_PREFIX=0:80:41
@@ -13,14 +12,18 @@ ZBASE=/tmp
 RBENV_ROOT='/local/usr/ruby'
 RUBY_VERS='2.1.1'	# fallback for ~ontohub/ontohub/.ruby-version
 SOLR_VERS='4.7.2'
+WEBAPP_PORT=3000	# where the webApp [de]muxer is listening for requests
 
 . ${SDIR}/lxc-install.kshlib || exit 1
 
 if [[ -z ${BRANCH} ]]; then
+	# hmm, wer keine Arbeit hat, macht sich halt welche ...
 	if [[ $ZNAME == 'ta' || $ZNAME == 'ontohub' || $ZNAME == 'www' ]]; then
-		BRANCH='master'
+		BRANCH='ontohub.org'				# master
 	elif [[ ${ZNAME} == 'tb' ]]; then
-		BRANCH='staging'
+		BRANCH='staging.ontohub.org'		# staging
+	elif [[ ${ZNAME} == 'tc' ]]; then
+		BRANCH='develop.ontohub.org'		# develop
 	else
 		BRANCH='develop'
 	fi
@@ -59,8 +62,8 @@ DATADIR[pool2]=(	# SSDs
 DATADIR[web]=(
 	z_pool=pool1/data/web z_dir=/data/web
 	mode=8#0755 )
-DATADIR[sites]=(
-	z_pool=pool1/data/web/sites
+DATADIR[httpd]=(
+	z_pool=pool1/data/web/httpd
 	mode=8#0755 uid=${ZUSER[ontohub].uid} gid=${ZUSER[ontohub].gid} )
 DATADIR[git]=(
 	z_pool=pool1/data/git z_dir=/data/git
@@ -93,13 +96,12 @@ addPkg install	fonts-liberation		# includes best non-prop. font ever seen
 # compiling without it will give a lot of headaches ('gem install rb-readline'
 # is NOT a workaround).
 addPkg install	libreadline6
-# when proper packages for the ruby based stuff are availble, the following
-# pkgs are probably not needed anymore (all required for ruby build and
-# building passenger-apache2-module)
-addPkg install	apache2-dev libapr1-dev libaprutil1-dev libcurl4-openssl-dev \
+addPkg install	curl gcc g++ make cmake	# only rugged needs cmake (+20 M)
+addPkg install	libssl-dev libpq-dev libcurl4-openssl-dev \
 	libxml2-dev libxslt1-dev pkg-config libreadline-dev
-addPkg install	curl gcc g++ cmake	# only rugged needs cmake (+20 M)
 if [[ ${BRANCH} != 'master' && ${BRANCH} != 'staging' ]]; then
+	#addPkg install	apache2-dev libapr1-dev libaprutil1-dev libcurl4-openssl-dev \
+	#libxml2-dev libxslt1-dev pkg-config libreadline-dev
 	# holy cow - capybara-webkit for ontohub testing (+230M => 1436M)
 	#            if you wanna waste your time, try that with qt5
 	addPkg install	libqt4-dev libqtwebkit-dev
@@ -117,18 +119,24 @@ sed -e '/^export APACHE_RUN_USER=/ s,=.*,=webservd,' \
 bootZone || exit $?
 checkDatadirsPost
 
+# sometimes one may need to switch over to webservd for testing
+[[ ${BRANCH} != 'master' ]] && \
+	sed -re '/^webservd:/ s,:[^:]+$,:/bin/bash,' -i ${ZROOT}/etc/passwd
+
+# and of course we are not paranoid
+chmod a+r ${ZROOT}/var/log/{dmesg,dmesg.*,kern.log,syslog} \
+	${ZROOT}/var/log/upstart/*
 
 # To avoid a chroot marathon we simply xfer the following functions as script
 # as well as supporting scripts into the zone and run it there.
 URL='https://raw.githubusercontent.com/ontohub/admin-scripts/master/scripts/install/'
-for X in passenger.patch oh-update.sh hashCerts ; do
-	if [[ ! -f ${SDIR}/$X && $X != 'passenger.patch' ]]; then
+for X in oh-update.sh hashCerts ; do
+	if [[ ! -f ${SDIR}/$X ]]; then
 		curl -O ~admin/etc/$X ${URL}$X
 		read -n 12 X <~admin/etc/$X
 		[[ $X == '#!/bin/ksh93' ]] || rm -f ~admin/etc/$X
 	fi
 	if [[ ! -f ~admin/etc/$X ]]; then
-		[[ $X == 'passenger.patch' ]] && continue	# not in repo
 		print "echo Fetch $0 from '${URL}/$X' and run it." \
 			>${ZROOT}/local/home/admin/etc/$X
 	else
@@ -185,60 +193,6 @@ eval "$(rbenv init -)"' >${RB_PROFILE}
 	#/bin/su - ruby -c "MAKE_OPTS='-j ${JOBS}' \
 	#	gem install nokogiri -- --use-system-libraries"
 
-	# And the Passenger (Rails (Rack)) module for Apache
-	# NOTE: needs a running zone (flawed comp env checks)!
-	X='cd /tmp\ngem fetch passenger\nX=${ ls -1 passenger-*.gem ; }\n'
-	X+='[[ -z $X ]] && exit 1\n'
-	# Keep just in case we need it again
-#	[[ -f ~admin/etc/passenger.patch ]] && \
-#		X+='gem patch $X ~admin/etc/passenger.patch'
-	X+="MAKE_OPTS='-j ${JOBS}' gem install passenger && "
-	X+='passenger-install-apache2-module -a --languages=ruby'
-	print "$X" >/tmp/pi.$$
-	/bin/su - ruby -c "ksh93 /tmp/pi.$$"
-	Log.info 'Passenger done.'
-	# TBD: check the alternative:
-	#print "deb https://oss-binaries.phusionpassenger.com/apt/passenger" \
-	#	"${LNX_CODENAME} main" >/etc/apt/sources.list.d/passenger.list
-	#apt-get update && apt-get install libapache2-mod-passenger
-
-	mkdir -p ${RB_ETC}
-	X=${ find ${RBENV_ROOT}/versions/${RUBY_VERS}/lib/ruby/gems \
-			-name mod_passenger.so 2>/dev/null ; }
-	[[ -z $X ]] && Log.warn "$0 - mod_passenger.so not found!" || \
-		cat>${RB_ETC}/passenger.conf<<EOF
-<IfModule !passenger_module>
-	LoadModule	passenger_module	$X
-</IfModule>
-PassengerEnabled Off
-#PassengerLogLevel 3
-# passenger-config --ruby-command |grep Apache
-PassengerDefaultRuby ${RBENV_ROOT}/versions/${RUBY_VERS}/bin/ruby
-# passenger-config --root
-PassengerRoot ${X%/buildout*}
-PassengerMaxPoolSize 10
-# NOTE: Passenger User switching is dumb! When its parent (httpd) is running
-# as non-root user, passenger processes will run with the same euid/egid as
-# its parent. If the parent runs with euid==root, it is impossible to instruct
-# the passenger to run completely unprivileged (at least it is not documented and
-# testing different combinations of related options were unsuccessful). So 
-# actually the best thing to do is to run the httpd as non-root service
-# with net_privaddr privileges or net_bind_service capabilities. On Linux this
-# is only possible using systemd. Unfortunately even the latest Ubuntu (utopic)
-# has no systemd support - it always coredumps and thus "booting" a zone becomes
-# impossible. That's why we need to take the 'living in the previous century'
-# approach =8-((( : start httpd as root, run it as User webservd and run 
-# passenger as root and let it spawn sub processes as webservd as well.
-# 
-PassengerUserSwitching Off
-PassengerUser webservd
-PassengerDefaultUser webservd
-PassengerAnalyticsLogUser webservd
-EOF
-	chown -R ruby:staff ${RB_ETC}
-
-	# To check success once apache is running (the latter is brain damaged):
-	# passenger-status ; passenger-memory-stats
 	Log.info "Ruby setup done."
 }
 
@@ -276,62 +230,167 @@ function postSolr {
 
 function postOntohub {
 	postInit || return $?
-	typeset SCRIPT=etc/god-serv.sh OHOME=~ontohub X DB RAILS_ENV
+	typeset SCRIPT OHOME=~ontohub X DB RAILS_ENV LOGLVL=debug
 
 	Log.info "$0 setup ..."
-	if [[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]]; then
+	if [[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]]; then
 		X='-P'
 		DB='ontohub'
 		RAILS_ENV='production'
+		LOGLVL='warn'	# don't wanna get useless debug msgs @INFO level
 	else
 		X=''
 		DB='ontohub_development'
 		RAILS_ENV='development'
 	fi
 		
+	SCRIPT='etc/god-serv.sh'
 	Log.info "$0 setup ..."
-	print '# Ontohub god (process manager)
-description "Ontohub god"
+	print 'description "Ontohub process manager aka god"
 start on (net-device-up and local-filesystems)
 stop on runlevel [016]
 
+# gracefull shutdowns may take more than 5s
+kill timeout 30
+
+respawn limit 3 30
 respawn
 setuid ontohub
 
 exec '"${OHOME}/${SCRIPT}"' start --no-daemonize
 
-pre-stop exec '"${OHOME}/${SCRIPT}"' stop'	>/etc/init/ontohub.conf
+pre-stop exec '"${OHOME}/${SCRIPT}"' stop'	>/etc/init/ontohub-god.conf
 
 	# The pid stuff seems to be hardcoded into config/god/app.rb - who knows,
 	# for what it is good. Also dumb upstart does not run a login shell even if
 	# setuid is given. So no profiles are sourced in before this one starts ...
 	[[ -d ${OHOME}/${SCRIPT%/*} ]] || mkdir -p ${OHOME}/${SCRIPT%/*}
 	print '#!/bin/ksh93
+[[ -z ${RAILS_ENV} ]] && RAILS_ENV='"${RAILS_ENV}"'
+
 HOME='"'${OHOME}'"'
-RAILS_ENV='"${RAILS_ENV}"'
+REPO="${HOME}/ontohub"
+
+# @see https://github.com/ruby/ruby/blob/trunk/gc.c#6960 && #104
+# Just the Defaults:
+integer RUBY_GC_HEAP_FREE_SLOTS=4*1024			# heap_free_slots
+integer RUBY_GC_HEAP_INIT_SLOTS=10000			# heap_init_slots
+integer RUBY_GC_MALLOC_LIMIT=16*1024*1024		# malloc_limit_min
+
 umask 002
 
 # When fired via upstart, profiles get ignored
 RB_PROFILE=/local/usr/ruby/.profile
 [[ -z ${RBENV_ROOT} && -f ${RB_PROFILE} ]] && source ${RB_PROFILE}
 
-cd ${HOME}/ontohub	# the repo clone
+cd ${REPO} || exit 1
 
 [[ -d ${HOME}/log ]] || mkdir ${HOME}/log
 [[ -e log ]] || ln -s ${HOME}/log log
-[[ -d tmp/pids ]] || mkdir -p tmp/pids
-print $$ >tmp/pids/god.pid		# well, who knows ...
+
 export RAILS_ENV HOME
 
 if [[ $1 == "start" ]]; then
 	shift
-	exec ${HOME}/bin/god --config-file config/god/app.rb \
-		--pid tmp/pids/god.pid --log-level debug --log ${HOME}/log/god.log "$@"
+	# Not sure, whether anything really needs this. Uncommitted interface!
+	[[ -d tmp/pids ]] || mkdir -p tmp/pids
+	print $$ >tmp/pids/god.pid
+
+	# god is dumb and sends logs per default to the given file AS WELL AS to
+	# syslog (and uses a redundant log format - windows users in action?) =8-(
+	${HOME}/bin/god --config-file config/god/app.rb \
+		--pid tmp/pids/god.pid \
+		--log-level '"${LOGLVL}"' --no-syslog --log ${HOME}/log/god.log "$@"
 elif [[ $1 == "stop" ]]; then
-	exec ${HOME}/bin/god terminate
+	${HOME}/bin/god terminate	# does an awfully poor job
+	# kill remaining stuff (seems like all idle workers) manually
+	REMAINS=( ${ pgrep -P 1 -f sidekiq ; } )
+	if (( ${#REMAINS[@]} )); then
+		print "${#REMAINS[@]} sidekiqs are still running - killing ..."
+		kill -9 ${REMAINS[@]}
+	else
+		print "All workers killed."
+	fi
 fi
 '	>${OHOME}/${SCRIPT}
 	chmod 0755 ${OHOME}/${SCRIPT}
+
+
+	SCRIPT='etc/puma-serv.sh'
+	print 'description "Ontohub WebApplication Server (puma)"
+start on (net-device-up and local-filesystems)
+stop on runlevel [016]
+
+# gracefull shutdowns may take more than 5s
+kill timeout 30
+
+reload signal USR2
+
+respawn limit 3 30
+respawn
+setuid webservd
+
+exec '"${OHOME}/${SCRIPT}"' start
+
+pre-stop exec '"${OHOME}/${SCRIPT}"' stop'  >/etc/init/ontohub-puma.conf
+
+	print '#!/bin/ksh93
+[[ -z ${RAILS_ENV} ]] && RAILS_ENV='"${RAILS_ENV}"'
+
+HOME='"'${OHOME}'"'
+REPO="${HOME}/ontohub"
+CTRL_SOCKET="unix:///tmp/pumactl.sock"
+
+# @see https://github.com/ruby/ruby/blob/trunk/gc.c#6960 && #104
+# @see http://tmm1.net/ruby21-rgengc/
+# taken AS IS from the original (JEL: have not seen any measurements/docs,
+# which say, that those values actually match the OHWS)
+integer RUBY_GC_HEAP_FREE_SLOTS=512*1024
+integer RUBY_GC_HEAP_INIT_SLOTS=128*1024
+integer RUBY_GC_MALLOC_LIMIT=64*1024*1024
+
+umask 002
+
+# When fired via upstart, profiles get ignored
+RB_PROFILE=/local/usr/ruby/.profile
+[[ -z ${RBENV_ROOT} && -f ${RB_PROFILE} ]] && source ${RB_PROFILE}
+
+cd ${REPO} || exit 1
+
+export RAILS_ENV RACK_ENV=${RAILS_ENV} HOME
+
+case "$1" in
+	start)
+		# Just for convinience, i.e. NOT a committed interface!
+		[[ -d tmp/pids ]] || mkdir -p tmp/pids
+		print $$ >tmp/pids/puma.pid
+
+		[[ -e ${CTRL_SOCKET} ]] && rm -f "${CTRL_SOCKET}"
+		# puma.rb takes care of chmod 0770 ${CTRL_SOCKET} so we need no token
+		${HOME}/bin/puma -C config/puma.rb \
+			--control=${CTRL_SOCKET} --control-token=
+		;;
+	stop)
+		if [[ -z ${UPSTART_JOB} ]]; then
+			${HOME}/bin/pumactl --control-url=${CTRL_SOCKET} stop
+		else
+			X=$(<tmp/pids/puma.pid)
+			print "Upstart request to stop puma $X ..."
+		fi
+		;;
+	restart|status|stats|halt|phased-restart)
+		if [[ -e ${CTRL_SOCKET#*://} ]]; then 
+			${HOME}/bin/pumactl --control-url=${CTRL_SOCKET} $1
+		else
+			print -u2 "Missing puma control socket ${CTRL_SOCKET#*://}" 
+			exit 1
+		fi
+		;;
+	*) print -u2 "Usage: ${0##*/} start|stop|restart|status|stats|halt|phased-restart"
+esac
+'	>${OHOME}/${SCRIPT}
+	chmod 0755 ${OHOME}/${SCRIPT}
+
 
 	DB=${ print 'SELECT COUNT(*) FROM ontology_file_extensions;' | \
 			su - ontohub -c "psql ${DB}" 2>/dev/null ; }
@@ -341,7 +400,8 @@ fi
 	[[ -n ${BRANCH} ]] && X+=" -b ${BRANCH}"
 	su - ontohub -c "~admin/etc/oh-update.sh $X"
 
-	service ontohub start
+	initctl start ontohub-god
+	initctl start ontohub-puma
 	Log.info "$0 done."
 }
 
@@ -357,7 +417,7 @@ function postDb {
 
 	typeset X=${ pg_config --bindir ; } Y Z DB SQL
 
-	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && DB='ontohub' \
+	[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && DB='ontohub' \
 		|| DB='ontohub_development,ontohub_test'
 
 	[[ ! -d ${PSQLDIR}/main ]] && mkdir ${PSQLDIR}/main && \
@@ -411,6 +471,9 @@ grant all on database '"$Y"' to ontohub;
 		fi
 		Z=''
 	done
+
+	chmod a+r /var/log/postgresql/*		# paranoid?
+
 	[[ -n ${SQL} ]] && print "${SQL}" | su - postgres -c psql
 	Log.info "$0 setup done."
 }
@@ -441,15 +504,13 @@ function postApache {
 			/etc/apache2/envvars.orig >${CFDIR}/envvars
 		# on linux this is bash ... =8-(
 		ADD='APACHE_ULIMIT_MAX_FILES=`ulimit -H -n`\n'
-		# Since webservice (httpd/passenger) and git service wanna write to
+		# Since webservice (httpd/webApp) and git service wanna write to
 		# the same dirs, make sure they use a proper umask to avoid any trouble
 		# (e.g. fs specifc ACLs, i.e. dropped POSIX draft vs. ZFS/NFS4 impl.)
 		# or the need, to run the services in privileged mode.
 		# dirs: 0777-002=0775   files: 0666-002=0664
 		ADD+='umask 002\n'
-		# avoid status 500 server errors (otherwise unix sockets would be used)
-		ADD+='export _PASSENGER_FORCE_HTTP_SESSION="true"\n'
-		# Hmm, some scripts call env ruby - so they need a path... =8-(
+		# Hmm, some scripts seem to call env ruby - so they need a path... =8-(
 		ADD+="export PATH=${RBENV_ROOT}/shims:/usr/bin/:/bin\n"
 		print -n "${ADD}" >>${CFDIR}/envvars
 	fi
@@ -471,7 +532,20 @@ set
 	fi
 
 	# the common "minimal" set for all httpd servers
-	[[ -e ${CFDIR}/httpd.conf ]] || cat>${CFDIR}/httpd.conf<<EOF
+	if [[ ! -e ${CFDIR}/httpd.conf ]]; then
+		integer STRANDS=${ nproc ; } MINSPARE TPC MAXCLIENTS 
+		(( STRANDS < 4 )) && STRANDS=4
+		(( TPC=STRANDS*0.75 ))
+		(( MINSPARE=STRANDS/4 ))
+		# Simple 30 client faban tests have shown, that puma/webApp is able to
+		# handle a / request per average in 0.025s w/o any error (passenger in
+		# 0.048s with lot of errors like sporadic connection refused etc.) and
+		# thus per strand 40 req/s. A client is allowed to make not more than
+		# 5 req at a time, so with 40/5 we get as a sufficient starting point
+		# (apache httpd will do the alignment for us):
+		(( MAXCLIENTS=STRANDS*8 ))
+
+		cat>${CFDIR}/httpd.conf<<EOF
 # For more information have a look at the default config file
 # /etc/apache2/apache2.conf and http://httpd.apache.org/docs/
 
@@ -517,10 +591,10 @@ ServerName	localhost
 # ServerLimit:		automatically determined == MaxClients/ThreadsPerChild + 1 
 
 StartServers		1
-MinSpareThreads		16
-MaxSpareThreads		48
-ThreadsPerChild		24
-MaxClients			192
+MinSpareThreads		${MINSPARE}
+MaxSpareThreads		${STRANDS}
+ThreadsPerChild		${TPC}
+MaxClients			${MAXCLIENTS}
 MaxRequestsPerChild	0
 
 TypesConfig			/etc/mime.types
@@ -592,7 +666,7 @@ CustomLog	"|/usr/bin/rotatelogs \${APACHE_LOG_DIR}/%Y%m%d-%H%M%S-access.log 2592
 Alias /error/ "/usr/share/apache2/error/"
 <Directory "/usr/share/apache2/error">
 	AllowOverride None
-	Options IncludesNoExec
+	Options +IncludesNoExec +SymLinksIfOwnerMatch
 	AddOutputFilter Includes html
 	AddHandler type-map var
 	Require all granted
@@ -658,6 +732,7 @@ IndexIgnore .ht* *~ *# HEADER* RCS CVS *,v *,t
 Include ${SITECF%/*}/extern.conf
 # vim: syntax=apache ts=4 sw=4 sts=4 sr noet
 EOF
+	fi
 
 	X=${CFDIR}/sites/pass
 	if [[ ! -x $X ]]; then
@@ -817,7 +892,14 @@ ExtendedStatus On
 
 AddEncoding gzip .gz
 
-#Include ${RB_ETC}/passenger.conf
+# Per default apache deduces 'application/x-gzip' from \.gz$ and unfortunately
+# "AddType ${type} ${ext1}.${ext2}" doesn't work. So:
+<FilesMatch "\.js\.gz$">
+	ForceType text/javascript
+</FilesMatch>
+<FilesMatch "\.css\.gz$">
+	ForceType text/css
+</FilesMatch>
 
 Listen ${ZIP}:80
 
@@ -860,33 +942,27 @@ ErrorLog	\${APACHE_LOG_DIR}/@NODENAME@.@DOMAIN@/error.log
 <IfModule rewrite_module>
 	LogLevel rewrite:error
 </IfModule>
-#<IfModule passenger_module>
-#	PassengerEnabled On
-#	PassengerDebugLogFile \${APACHE_LOG_DIR}/@NODENAME@.@DOMAIN@/passenger.log
-##	PassengerLogLevel 7
-#	PassengerAppEnv production
-## taken AS IS from the original config
-##	Header always unset "X-Powered-By"
-##	Header always unset "X-Runtime"
-#	SetEnv RUBY_GC_MALLOC_LIMIT 59000000
-#	SetEnv RUBY_GC_HEAP_FREE_SLOTS 600000
-#	SetEnv RUBY_GC_HEAP_INIT_SLOTS 100000
-#</IfModule>
 
 <IfModule rewrite_module>
 	RewriteEngine On
+	#LogLevel rewrite_module:trace5
+	LogLevel rewrite_module:notice
+
 	RewriteRule ^/server-   -   [L]
     
 	RewriteCond %{HTTP_HOST} !=@NODENAME@.@DOMAIN@
 	RewriteCond %{HTTP_HOST} !=@NODENAME@
 	RewriteCond %{HTTP_HOST} !=localhost
 	RewriteCond %{HTTPS} =on
-	RewriteRule ^/(.*)  https://@NODENAME@.@DOMAIN@/$1 [R=301,L]
+	RewriteRule ^/(.*)  https://@NODENAME@.@DOMAIN@/\$1 [R=301,L]
 	RewriteCond %{HTTP_HOST} !=@NODENAME@.@DOMAIN@
 	RewriteCond %{HTTP_HOST} !=@NODENAME@
 	RewriteCond %{HTTP_HOST} !=localhost
 	RewriteCond %{HTTPS} !=on
-	RewriteRule ^/(.*)  http://@NODENAME@.@DOMAIN@/$1  [R=301,L]
+	RewriteRule ^/(.*)  http://@NODENAME@.@DOMAIN@/\$1  [R=301,L]
+
+	# this stuff gets usually handled by this httpd instance itself
+	RewriteRule ^/(cgi-bin|icons|apache|error)	- [L]
 </IfModule>
 
 DocumentRoot ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/htdocs
@@ -896,7 +972,9 @@ DocumentRoot ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/htdocs
 	LanguagePriority de en
 	ForceLanguagePriority Prefer Fallback
 	AllowOverride AuthConfig Limit
-	Options +Indexes +Includes +MultiViews
+	# If rewrite engine is on (default), SymLinksIfOwnerMatch is needed as well
+	# @since 2.4 (don't use FollowSymLinks wich would also satisfy it)
+	Options +Indexes +Includes +MultiViews +SymLinksIfOwnerMatch
 	Require all granted
 </Directory>
 
@@ -907,27 +985,6 @@ ScriptAlias	/cgi-bin/ ${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin/
 <Directory "${SITEDIR%/*}/@NODENAME@.@DOMAIN@/cgi-bin">
 	Require all granted
 </Directory>
-
-# NOTE:
-# Actually using context aka app dirs (i.e. /$appName ) is very smart and
-# should always be used. Unfortunately passenger (at least version 4.x) is
-# buggy (see https://github.com/phusion/passenger/issues/1315 ) and needs to be
-# forced to use TCP instead of UNIX sockets to workaround the bugs (Server
-# Errors - Status 500 - on reload/every 2nd click, unless caching gets disabled,
-# which is even worse. Also this fixes the ontohub.png image not found problem).
-# And in turn if TCP sockets are forced, context dirs do not work anymore
-# (another bug?). So to have a reliable app one can't neither use fast/cheap
-# unix sockets nor app context dirs like this:
-#Alias /@appName@/ @appDir@/public/
-#<Directory @appDir@/public>
-#	Options -MultiViews +SymLinksIfOwnerMatch
-#	Require all granted
-#</Directory>
-#<Location /@appName@/>
-#	PassengerBaseURI /@appName@
-#	PassengerAppRoot @appDir@
-#	PassengerAppEnv production
-#</Location>
 
 #<Directory "/web">
 #	AddType text/plain .sh
@@ -954,49 +1011,80 @@ EOF
 			mkdir -p ${APACHE_LOG_DIR}/${ZNAME}.${ZDOMAIN}
 	)
 
-	sed -e '/passenger.conf/ s,^#,,' -i ${SITECF%/*}/extern.conf
-
 	if [[ ! -e ${SITECF} ]]; then
 		sed -e "s,@NODENAME@,${ZNAME},g" \
 			-e "s,@DOMAIN@,${ZDOMAIN},g" ${SITECF%/*}/template.conf >${SITECF}
 
 		# ontohub specials
-		typeset APPBASE='/local/home/ontohub/ontohub/public' APPNAME='ruby' \
-			RENV='development'
-		[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && \
-			RENV='production'
+		typeset APPBASE="${OHOME}/ontohub/public" RENV='development' ASSETS
+		[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && \
+			RENV='production' && ASSETS='|assets'
 	
-		# context apps do not work dueto bogus passenger (4.x)
-#		sed -e "/^#Alias \/@appName@/,/^#<\/Location/ { s,^#,, ; s,@appName@,${APPNAME}, ; s,@appDir@,${APPBASE%/public}, }" \
-#		-i ${SITECF}
-
 		# so map the app completely to /
 		sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
 			-e "/^<Directory .*\/htdocs\"?/ s,^.*,<Directory \"${APPBASE}\">," \
-			-e '/^DocumentRoot/,/^<\/Directory>/ s,\+MultiViews,-MultiViews +SymLinksIfOwnerMatch,' \
 			-i ${SITECF}
 
 		# maintenance.txt is hardcoded into lib/capistrano/tasks/maintenance.cap
 		# and git/lib/git_shell.rb - prefer to have the rewrite rules in the
 		# main config instead of a .htaccess somewhere in the wild
-		sed -e "/PassengerAppEnv/ s,production,${RENV}," \
-			-e '/#<IfModule passenger_module/,/#<\/IfModule/ s,^#,,' \
-			-e '/^DocumentRoot/ {
-a\
-<Location /> \
-	# no trailing slashes \
-	RewriteCond %{REQUEST_URI} .+/$ \
-	RewriteRule ^(.+)/$ /$1 [R=301,L] \
- \
-	RewriteCond %{DOCUMENT_ROOT}/../data/maintenance.txt -f \
-	RewriteRule .* /503.html [R=503,L] \
-</Location>
-}'			-i ${SITECF}
-
 		print '
+<IfModule rewrite_module>
+	# this needs to be outside the repo dir
+	RewriteCond '"${OHOME}"'/maintenance.txt -f
+	RewriteCond %{REQUEST_URI} !^/(cgi-bin|icons|apache|error|server-)/
+	RewriteRule . /error/HTTP_SERVICE_UNAVAILABLE.html.var [R=503,L]
+
+	# no trailing slashes - why? Is it to fix a webapp bug?
+	RewriteCond %{REQUEST_URI} .+/$
+	RewriteRule ^(.+)/$ /$1 [R=301,L]
+
+	# If there is already a {js|css}.gz file, do not deflate the original but
+	# use the pre-compressed one as is instead.
+	RewriteCond %{HTTP:Accept-Encoding} gzip
+	RewriteCond %{DOCUMENT_ROOT}%{REQUEST_URI}.gz -s
+	RewriteRule ^(.*\.(js|css))$ $1.gz [E=no-gzip,QSA,L]
+</IfModule>
+
+<IfModule proxy_module>
+	# per contract requests with these prefixes are served by the httpd itself
+	ProxyPassMatch ^/(cgi-bin|icons|apache|error|server'"${ASSETS}"') !
+	# pass everything else to the webApp
+	ProxyPass / http://localhost:3000/
+
+	ProxyRequests Off
+	ProxyVia Block
+	ProxyPreserveHost On
+
+	# use system default buf size
+	ProxyReceiveBufferSize 0
+
+	<Proxy * >
+		Require all granted
+	</Proxy>
+</IfModule>
+
+<IfModule mem_cache_module>
+	MCacheMaxObjectCount 10000
+	MCacheMaxObjectSize  131072
+	MCacheRemovalAlgorithm GDSF
+	MCacheSize 1048576
+	CacheEnable mem /
+	CacheIgnoreNoLastMod On
+</IfModule>
+
+<IfModule headers_module>
+	#Header always unset "X-Powered-By"
+	Header always unset "X-Runtime"
+	Header always unset "X-Rack-Cache"
+</IfModule>
+
 # taken AS IS from the original
 <IfModule deflate_module>
-	<IfModule mod_filter.c>
+	<IfModule !filter_module>
+		LoadModule	filter_module		modules/mod_filter.so
+	</IfModule>
+	<IfModule filter_module>
 		# these are known to be safe with MSIE 6
 		AddOutputFilterByType DEFLATE text/html text/plain text/xml
 
@@ -1007,6 +1095,9 @@ a\
 	</IfModule>
 </IfModule>
 '			>>${SITECF}
+
+		# enable proxy modules
+		sed -e '/\!proxy_module>/,+5 s,^#,,' -i ${SITECF%/*}/extern.conf
 	fi
 
 	chown -R webadm:staff ${SITEDIR}
@@ -1112,7 +1203,7 @@ function postInstall {
 	postDb
 	postSolr	# Gets a symlink to a repo clone sub dir!
 	postRuby
-	postApache	# Order! We include the postRuby generated passenger.conf
+	postApache
 	postOntohub	# Order! Deps on postRuby
 	postGit
 
@@ -1124,17 +1215,17 @@ function postInstall {
 PSQLDIR=${DATADIR[psql].z_dir}
 REDISDIR=${DATADIR[redis].z_dir}
 GITDATA=${DATADIR[git].z_dir}
-SITEDIR=/${DATADIR[sites].z_pool#*/}/${ZNAME}.${ZDOMAIN}
+SITEDIR=/${DATADIR[httpd].z_pool#*/}/${ZNAME}.${ZDOMAIN}
 integer HAS_SOLR=0
 
 FN=' normalizeRubyVersion'
 for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=" $X" ; done
 
-ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\n' 
+ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\nOHOME=~ontohub\n' 
 ZSCRIPT+='integer INIT=0 JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
 ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
 	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS RUBY_VERS RBENV_ROOT \
-	GITDATA BRANCH HAS_SOLR ; }\n"
+	GITDATA BRANCH HAS_SOLR WEBAPP_PORT ; }\n"
 ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInit\n'
 ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"
 ZSCRIPT+='#typeset -ft ${ typeset +f ; }\n\n'
