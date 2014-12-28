@@ -11,6 +11,8 @@ MAIL_GW='mail'
 DEFAULT_BRANCH='staging.ontohub.org'
 # The port the web application should use (the httpd proxy connects to)
 WEBAPP_PORT=3000
+# The directory, which contains bin/hets-server and lib/hets-server etc.
+HETS_DESTDIR=/usr
 
 typeset -A CFG
 export LC_CTYPE=C LC_MESSAGES=C LC_COLLATE=C LC_TIME=C GIT=${ whence git ; }
@@ -118,7 +120,7 @@ function updateRepo {
 		print "$Y" >.ruby-version
 
 	if (( ! PULL )); then
-		# base config for the first time
+		# base config for the first time, only.
 		typeset A B X HNAME
 		integer I
 		A=( ${ getent hosts ${ hostname ; } ; } )
@@ -189,6 +191,17 @@ function updateRepo {
 		# oh my goodness, this stuff is whitespace sensitive!
 		sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
 			-i app/assets/stylesheets/navbar.css.sass
+		# correct/skip unused pathes
+		sed -e '/^version_minimum_version:/ h
+/^hets_path:/,/^version_minimum_version:/ d
+/^version_minimum_revision:/ { H; x; i\hets_path:\
+  - '"${HETS_DESTDIR}"'/bin/hets-server\
+hets_lib:\
+  - '"${HETS_DESTDIR}"'/lib/hets-server\
+hets_owl_tools:\
+  - '"${HETS_DESTDIR}"'/lib/hets-server/hets-owl-tools\
+
+}'			-i config/hets.yml
 	fi
 	if [[ ! -e config/puma.rb ]]; then
 		# For more or less modern, i.e. thread aware impl.s like JRuby or
