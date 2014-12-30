@@ -400,6 +400,11 @@ esac
 	[[ -n ${BRANCH} ]] && X+=" -b ${BRANCH}"
 	su - ontohub -c "~admin/etc/oh-update.sh $X"
 
+	# allow ssh login
+	sed -e '/^AllowUsers/ { s, ontohub,,g ; s,$, ontohub, }' \
+		-i /etc/ssh/sshd_config
+
+	initctl restart ssh
 	initctl start ontohub-god
 	initctl start ontohub-puma
 	Log.info "$0 done."
@@ -1111,11 +1116,35 @@ function postGit {
 	#postInit || return $?
 
 	Log.info "$0 setup ..."
-	Log.warn "$0: TBD"
 	# see config/initializers/paths.rb , app/models/repository/symlink.rb ,
 	# lib/tasks/databases.rake -> 'repositories', 'git_daemon' and 'commits'
 	# are hardcoded data sub dirs. script/backup is another consumer, however,
 	# its CLI usage is not POSIX conform and requires other fixes anyway ...
+
+	# If a user has registered itself, he should be able to add new ssh keys
+	# via http://$site/keys/new  (${UserName} | 'SSH Keys'). Per default the
+	# key gets append as is to ~git/.ssh/authorized_keys (not authorized_keys2)
+	# including some additional options like: no-{port,x11,agent}-forwarding,\
+	# no-pty,command="/local/home/ontohub/ontohub/git/bin/git-shell 2".
+	# To separate this data from unneeded data, we re-route the webApp to 
+	# ${GITDATA}/.ssh/authorized_keys instead (config/initializers/paths.rb).
+	# Unfortunately to allow git-via-ssh-access we can't simply symlink it to
+	# ~git/.ssh/authorized_keys[2], because sshd in 'StrictModes yes' verifies,
+	# that ~git/.ssh/ as well as the keyfile is only writable by the connecting
+	# user git. The bad thing is, that this setting can't be adjusted for a
+	# single user - it is an "all or nothing" option (and thus a no go).
+	# So our workaround is to let an suid script/binary copy this data over to
+	# ~git/.ssh/authorized_keys2 when it got modified via app/models/key.rb.
+
+	# If one creates a repo via webApp, the webApp does a cd to $ontohubRepo 
+	# (for us ~ontohub/ontohub/), than clones the given repo URI to
+	# $ontohubRepo/data/repositories/${num} and creates a symlink to it like:
+	# ln -s $ontohubRepo/data/repositories/${num} data/git_daemon/${name.git}
+	# To separate this data from the $ontohubRepo we symlink ${GITDATA} to
+	# $ontohubRepo/data in the ~admin/etc/oh-update.sh script. 
+	# So the webApp needs RW to ${GITDATA}/{git_daemon,repositories,commits}/
+	# (the last one for CLI usage?) too.
+
 	print 'start on startup
 stop on shutdown
 #setuid git
@@ -1127,14 +1156,43 @@ exec /usr/bin/git daemon --reuseaddr --export-all --syslog \
 	--base-path='"${GITDATA}/repositories"'
 respawn'	>/etc/init/git-serv.conf
 
-	typeset GITSSH="${GITDATA}/.ssh"
-	[[ -f ~git/.ssh/authorized_keys2 && ! -f ${GITSSH}/authorized_keys2 ]] && \
-		cp -p ~git/.ssh/authorized_keys2 ${GITSSH}/
-	ln -sf ${GITSSH}/authorized_keys2 ~git/.ssh/authorized_keys2
-	# see coments in postApache
-	chmod 0660 ${GITSSH}/authorized_keys2
+	typeset KEYS="${GITDATA}/.ssh/authorized_keys"
+	typeset SCRIPT="${KEYS%/*}/cp_keys" UKEYS=~git/.ssh/authorized_keys2
+	if [[ ! -x ${SCRIPT} ]]; then
+		# because Linux has no useable RBAC system, we can't simply use a shell
+		# script, which copies A to B but need a unflexible suid binary =8-(:
+		print '#include <unistd.h>
+#include <stdlib.h>
+
+int
+main(int argc, char *argv[])
+{
+	char *nenv[] = { NULL };
+	char *nargv[] = { NULL, "'"${KEYS}"'", "'"${UKEYS}"'", NULL };
+	nargv[0] = argv[0];
+	int res = execve("/bin/cp", nargv, nenv);
+	perror("execve");
+	exit(res);
+}'		>/tmp/cp_keys.c
+		gcc -o /tmp/cp_keys /tmp/cp_keys.c
+		strip /tmp/cp_keys
+		cp /tmp/cp_keys ${SCRIPT}
+	fi
+	chown git:webservd ${SCRIPT} && chmod 4500 ${SCRIPT}	# exec as user git
+	# just reduce potential users to a minimum to avoid race problems
+	chacl u::r-x,g::---,o::---,u:admin:rwx,u:ontohub:r-x,u:webservd:--x,m::rwx \
+		${SCRIPT}
+	# our zone install ensures, that there is a ~git/.ssh/authorized_keys2 with
+	# the right owner and permissions
+	[[ ! -f ${KEYS} ]] && cp -p ${UKEYS} ${KEYS}
+	chown webservd:webservd ${KEYS}
+	chmod 0640 ${KEYS}
+	# make new files group writable
 	print 'umask 002' >>~git/.profile
+
+	sed -e '/^AllowUsers/ { s, git,,g ; s,$, git, }' -i /etc/ssh/sshd_config
 	
+	initctl restart ssh
 	service git-serv start
 	Log.info "$0 setup done."
 }

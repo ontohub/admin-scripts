@@ -202,6 +202,11 @@ hets_owl_tools:\
   - '"${HETS_DESTDIR}"'/lib/hets-server/hets-owl-tools\
 
 }'			-i config/hets.yml
+		# See ~admin/etc/post-install2.sh (postGit()) - "COW"
+		sed -e "/#{config.git_user}/ s,=.*,= '${CFG[datadir]}'," \
+			-i config/initializers/paths.rb
+		sed -e "/AuthorizedKeysManager/ a\    system('${CFG[datadir]}/.ssh/cp_keys')" \
+			-i app/models/key.rb
 	fi
 	if [[ ! -e config/puma.rb ]]; then
 		# For more or less modern, i.e. thread aware impl.s like JRuby or
