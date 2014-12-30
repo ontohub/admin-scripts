@@ -12,6 +12,7 @@ ZBASE=/tmp
 RBENV_ROOT='/local/usr/ruby'
 RUBY_VERS='2.1.1'	# fallback for ~ontohub/ontohub/.ruby-version
 SOLR_VERS='4.7.2'
+ES_VERS='1.4.1'
 WEBAPP_PORT=3000	# where the webApp [de]muxer is listening for requests
 
 . ${SDIR}/lxc-install.kshlib || exit 1
@@ -228,6 +229,47 @@ function postSolr {
 	Log.info "$0 done."
 }
 
+function postElasticsearch {
+	postInit || return $?
+	(( HAS_SOLR )) && return 0
+
+	Log.info "$0 setup ..."
+	[[ ! -d ${SITEDIR}/tmp ]] && mkdir -p ${SITEDIR}/tmp
+	cd ${SITEDIR}/tmp  || return 1
+	typeset X Y \
+		ESBASE='http://download.elasticsearch.org/elasticsearch/elasticsearch'
+	[[ -e elasticsearch-${ES_VERS}.deb ]] && \
+		X=${ file elasticsearch-${ES_VERS}.deb ; }
+	if [[ ! $X =~ 'Debian binary package' ]]; then
+		rm -f elasticsearch-${ES_VERS}.deb
+		curl -O ${ESBASE}/elasticsearch-${ES_VERS}.deb
+	fi
+	X=${ getent passwd esearch ; }
+	if [[ -z $X ]]; then
+		X=${ getent group esearch ; }
+		if [[ -z $X ]]; then
+			print 'esearch:x:121:' >>/etc/group
+			X=121
+		else
+			Y=( ${X//:/ } )
+			X=${Y[3]}
+		fi
+		print "esearch:x:121:${X}:Elastic Search:/usr/share/elasticsearch:/bin/false" >>/etc/passwd
+		print 'esearch:*:16434:0:99999:7:::' >>/etc/shadow
+	fi
+	dpkg --unpack elasticsearch-${ES_VERS}.deb
+	sed -r -e '/^#?ES_(USER|GROUP)=/ { s,^#,, ; s,=.*,=esearch, }' \
+		-i /etc/default/elasticsearch.dpkg-new
+	# fix package purging
+	sed -e '/rmdir/ s,$, || true,' -i /var/lib/dpkg/info/elasticsearch.postrm
+	# and finally configure the pkg
+	dpkg --configure elasticsearch
+	update-rc.d elasticsearch defaults 95 10
+	# misc interesting stuff: /etc/elasticsearch/{logging|elasticsearch}.yml
+
+	service elasticsearch start
+}
+
 function postOntohub {
 	postInit || return $?
 	typeset SCRIPT OHOME=~ontohub X DB RAILS_ENV LOGLVL=debug
@@ -416,6 +458,8 @@ function postDb {
 	Log.info "$0 setup ..."
 	service redis-server stop
 	sed -e "/^dir / s,^.*,dir ${REDISDIR}," -i /etc/redis/redis.conf
+	grep -q ^redis /etc/services || \
+		print 'redis\t\t6379/tcp\t\t\t# Redis DB (default port)' >>/etc/services
 	service redis-server start
 
 	service postgresql stop
@@ -1104,6 +1148,9 @@ EOF
 		# enable proxy modules
 		sed -e '/\!proxy_module>/,+5 s,^#,,' -i ${SITECF%/*}/extern.conf
 	fi
+	
+	grep -q ^rails /etc/services || \
+		print 'rails\t\t3000/tcp\t\t\t# ruby on rails/puma' >>/etc/services
 
 	chown -R webadm:staff ${SITEDIR}
 	#chown -R ontohub:webservd ${SITEDIR}
@@ -1250,7 +1297,8 @@ function postInstall {
 	# pull/checkout to get the needed ruby version
 	su - ontohub -c "~admin/etc/oh-update.sh $X -u" 
 	postInit || return $?	# because this may change pkg selection
-	(( HAS_SOLR )) && PKGS+=' tomcat7 tomcat7-admin'
+	(( HAS_SOLR )) && PKGS+=' tomcat7 tomcat7-admin' || \
+		PKGS+=' openjdk-7-jre-headless'	# actually redundant (hets deps on it)
 
 	# hets and tomcat need JRE, which in turn needs a running zone (pkg assembly
 	# issue). redis-server does not, but putting it here saves an additional
@@ -1260,6 +1308,7 @@ function postInstall {
 
 	postDb
 	postSolr	# Gets a symlink to a repo clone sub dir!
+	postElasticsearch
 	postRuby
 	postApache
 	postOntohub	# Order! Deps on postRuby
@@ -1282,7 +1331,7 @@ for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=" $X" ; done
 ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\nOHOME=~ontohub\n' 
 ZSCRIPT+='integer INIT=0 JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
 ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
-	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS RUBY_VERS RBENV_ROOT \
+	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS ES_VERS RUBY_VERS RBENV_ROOT \
 	GITDATA BRANCH HAS_SOLR WEBAPP_PORT ; }\n"
 ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInit\n'
 ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"

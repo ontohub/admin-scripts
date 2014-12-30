@@ -430,6 +430,7 @@ function resetDb {
 		~/bin/rake db:migrate:clean
 		~/bin/rake db:seed
 		~/bin/rake db:migrate
+		~/bin/rake environment elasticsearch:import:model CLASS=Ontology
 	fi
 }
 
