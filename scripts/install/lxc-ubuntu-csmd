@@ -38,7 +38,7 @@ unset SOPT DEFAULT MIRROR SECURITY_MIRROR ; typeset -A SOPT DEFAULT
 # Miniroot packages, only. Any change here requires '-f' to reflect changes!
 # The previous/packaged ubuntu template honors packages_template env var :(
 # for whatever reason. So to be compatible ...
-A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
+A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils acl -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
 X="${A[*]}"
 unset A
 
