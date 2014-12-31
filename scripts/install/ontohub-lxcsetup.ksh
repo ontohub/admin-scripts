@@ -10,8 +10,7 @@ ZNMASK='/24'
 ZBASE=/tmp
 
 RBENV_ROOT='/local/usr/ruby'
-RUBY_VERS='2.1.1'	# fallback for ~ontohub/ontohub/.ruby-version
-SOLR_VERS='4.7.2'
+RUBY_VERS='2.1.1'	# fallback for ${OHOME}/ontohub/.ruby-version
 ES_VERS='1.4.1'
 WEBAPP_PORT=3000	# where the webApp [de]muxer is listening for requests
 
@@ -165,7 +164,7 @@ function postRuby {
 	X="[[ -r ${RB_PROFILE} ]] && . ${RB_PROFILE}" 
 	print "$X" >>~ruby/.profile
 	# calls gem s well
-	print "$X" >>~ontohub/.profile
+	print "$X" >>${OHOME}/.profile
 	
 	# rbenv stuff
 	[[ ! -d ${RBENV_ROOT%/*} ]] && mkdir -p ${RBENV_ROOT%/*}
@@ -202,30 +201,61 @@ function postSolr {
 	(( HAS_SOLR )) || return 0
 
 	Log.info "$0 setup ..."
-	typeset X SOLRBASE='http://apache.openmirror.de/lucene/solr' \
-		REPO_SCONF=~ontohub/ontohub/solr/conf
+	typeset X BN \
+		SOLRBASE='http://archive.apache.org/dist/lucene/solr' SOLR_VERS='3.6.2'\
+		LOGBASE='http://www.slf4j.org/dist' LOG_VERS='1.7.9' \
 
-	# deploy solr on tomcat (~150 MB archive + 0.5 MB the extracted solr.war)
 	[[ ! -d ${SITEDIR}/tmp ]] && mkdir -p ${SITEDIR}/tmp
 	cd ${SITEDIR}/tmp  || return 1
-	[[ -e solr-${SOLR_VERS}.tgz ]] && X=${ file solr-${SOLR_VERS}.tgz ; }
+
+	# deploy solr on tomcat (~150 MB archive + 0.5 MB the extracted solr.war)
+	(( ${SOLR_VERS%%.*} < 4 )) && BN='apache-solr' || BN='solr'
+	[[ -e ${BN}-${SOLR_VERS}.tgz ]] && X=${ file ${BN}-${SOLR_VERS}.tgz ; }
 	if [[ ! $X =~ 'gzip compressed data' ]]; then
-		rm -f solr-${SOLR_VERS}.tgz
-		curl -O ${SOLRBASE}/${SOLR_VERS}/solr-${SOLR_VERS}.tgz
+		rm -f ${BN}-${SOLR_VERS}.tgz
+		curl -O ${SOLRBASE}/${SOLR_VERS}/${BN}-${SOLR_VERS}.tgz
 	fi
-	gunzip -c solr-${SOLR_VERS}.tgz | \
+	gunzip -c ${BN}-${SOLR_VERS}.tgz | \
 		tar xvf - --strip-components=2 \
-			solr-${SOLR_VERS}/dist/solr-solrj-${SOLR_VERS}.jar
-	mv solr-solrj-${SOLR_VERS}.jar /var/lib/tomcat7/webapps/solr.war || return 1
+			${BN}-${SOLR_VERS}/dist/${BN}-${SOLR_VERS}.war
+	mv ${BN}-${SOLR_VERS}.war /var/lib/tomcat7/webapps/solr.war || return 1
 	chown tomcat7:tomcat7 /var/lib/tomcat7/webapps/solr.war
 
+	if (( ${SOLR_VERS%%.*} >= 4 )); then
+		[[ -e slf4j-${LOG_VERS}.tar.gz ]] && \
+			X=${ file slf4j-${LOG_VERS}.tar.gz ; } || X=''
+		if [[ ! $X =~ 'gzip compressed data' ]]; then
+			rm -f slf4j-${LOG_VERS}.tar.gz
+			curl -O ${LOGBASE}/slf4j-${LOG_VERS}.tar.gz
+		fi
+		gunzip -c slf4j-${LOG_VERS}.tar.gz | \
+			tar xvf - --strip-components=1 \
+				slf4j-${LOG_VERS}/jcl-over-slf4j-${LOG_VERS}.jar \
+				slf4j-${LOG_VERS}/slf4j-{jdk14-${LOG_VERS}.jar,api-${LOG_VERS}.jar}
+		mv *.jar /usr/share/tomcat7/lib/ 2>/dev/null
+	fi
+
+	# need to wait until it is deployed, so we can adjust the web.xml directly
 	for (( I=0; I < 300; I++  )); do
 		[[ -d /var/lib/tomcat7/webapps/solr ]] && break
 		sleep 0.2
 	done
-	# TBD: This is dangerous/works as long as the webapp doesn't get redeployed
-	ln -sf ${REPO_SCONF} /var/lib/tomcat7/webapps/solr/conf
+	
+	# final adjustments / needs to pickup the slf4j libs
+	cd /var/lib/tomcat7
+	X='solr/data'
+	mkdir -p $X && chmod 0775 $X && chown tomcat7:webservd $X
+	ln -s ${OHOME}/ontohub/solr/conf solr/conf	# does NOT work with 4.x!
+	sed -e '/<env-entry>/ i\-->' -e '/<\/env-entry>/ a\<!--' \
+		-e "/env-entry-value/ s,>.*<,>${PWD}/solr<," \
+		-i webapps/solr/WEB-INF/web.xml
 	chmod 0755 /var/log/tomcat7			# 0750 is too paranoid
+
+	grep -q ^solr /etc/services || \
+		print 'solr\t\t8983/tcp\t\t\t# Solr Search' >>/etc/services
+
+	service tomcat7 restart
+
 	Log.info "$0 done."
 }
 
@@ -274,7 +304,7 @@ function postElasticsearch {
 
 function postOntohub {
 	postInit || return $?
-	typeset SCRIPT OHOME=~ontohub X DB RAILS_ENV LOGLVL=debug
+	typeset SCRIPT X DB RAILS_ENV LOGLVL=debug
 
 	Log.info "$0 setup ..."
 	if [[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]]; then
@@ -1067,9 +1097,10 @@ EOF
 			-e "s,@DOMAIN@,${ZDOMAIN},g" ${SITECF%/*}/template.conf >${SITECF}
 
 		# ontohub specials
-		typeset APPBASE="${OHOME}/ontohub/public" RENV='development' ASSETS
+		typeset APPBASE="${OHOME}/ontohub/public" RENV='development' ASSETS=''
 		[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && \
 			RENV='production' && ASSETS='|assets'
+		[[ ${OHOME}/ontohub/public/static ]] && ASSETS+='|static'
 	
 		# so map the app completely to /
 		sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
@@ -1186,7 +1217,7 @@ function postGit {
 	# ~git/.ssh/authorized_keys2 when it got modified via app/models/key.rb.
 
 	# If one creates a repo via webApp, the webApp does a cd to $ontohubRepo 
-	# (for us ~ontohub/ontohub/), than clones the given repo URI to
+	# (for us ${OHOME}/ontohub/), than clones the given repo URI to
 	# $ontohubRepo/data/repositories/${num} and creates a symlink to it like:
 	# ln -s $ontohubRepo/data/repositories/${num} data/git_daemon/${name.git}
 	# To separate this data from the $ontohubRepo we symlink ${GITDATA} to
@@ -1264,16 +1295,16 @@ function normalizeRubyVersion {
 
 function postInit {
 	(( INIT )) && return 0
-	[[ -d ~ontohub/ontohub ]] || return 1
+	[[ -d ${OHOME}/ontohub ]] || return 1
 	
 	# let this file dictate the ruby version to install - anyway, it is so
 	# hard to write down the correct version number ... - muhhh
-	typeset X=${ normalizeRubyVersion ~ontohub/ontohub/.ruby-version ; }
+	typeset X=${ normalizeRubyVersion ${OHOME}/ontohub/.ruby-version ; }
 	[[ -n $X ]] && RUBY_VERS="$X"
-	grep -q _solr ~ontohub/ontohub/Gemfile && HAS_SOLR=1
+	grep -q _solr ${OHOME}/ontohub/Gemfile && HAS_SOLR=1
 	Log.info "Using ruby version '${RUBY_VERS}'."
 	RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"
-	X=$(<~ontohub/ontohub/.git/HEAD)
+	X=$(<${OHOME}/ontohub/.git/HEAD)
 	[[ $X =~ '/' ]] && BRANCH="${X##*/}"
 	INIT=1
 }

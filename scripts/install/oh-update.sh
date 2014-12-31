@@ -120,6 +120,7 @@ function updateRepo {
 		print "$Y" >.ruby-version
 
 	if (( ! PULL )); then
+		Log.info 'Applying 1st time aka only once modifications ...'
 		# base config for the first time, only.
 		typeset A B X HNAME
 		integer I
@@ -191,6 +192,7 @@ function updateRepo {
 		# oh my goodness, this stuff is whitespace sensitive!
 		sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
 			-i app/assets/stylesheets/navbar.css.sass
+
 		# correct/skip unused pathes
 		sed -e '/^version_minimum_version:/ h
 /^hets_path:/,/^version_minimum_version:/ d
@@ -202,6 +204,10 @@ hets_owl_tools:\
   - '"${HETS_DESTDIR}"'/lib/hets-server/hets-owl-tools\
 
 }'			-i config/hets.yml
+		[[ -e lib/tasks/hets.rake ]] && \
+			sed -e '/HETS_CMD =/ s,hets ,hets-server ,' -i lib/tasks/hets.rake
+		sed -e '/system/ s,hets ,hets-server ,' -i lib/tasks/test.rake
+
 		# See ~admin/etc/post-install2.sh (postGit()) - "COW"
 		sed -e "/#{config.git_user}/ s,=.*,= '${CFG[datadir]}'," \
 			-i config/initializers/paths.rb
@@ -209,6 +215,7 @@ hets_owl_tools:\
 			-i app/models/key.rb
 	fi
 	if [[ ! -e config/puma.rb ]]; then
+		Log.info 'Creating config/puma.rb ...'
 		# For more or less modern, i.e. thread aware impl.s like JRuby or
 		# Rubinius one would probably start with 1 or #CPUs workers,
 		# #STRANDs/#CPUs as #MaxThreads and #MaxThread/4 as #MinThreads per
@@ -432,6 +439,9 @@ function resetDb {
 		~/bin/rake db:migrate
 		~/bin/rake environment elasticsearch:import:model CLASS=Ontology
 	fi
+	~/bin/rake generate:metadata
+	~/bin/rake import:logicgraph
+	[[ -f lib/tasks/hets.rake ]] && ~/bin/rake hets:generate_first_instance
 }
 
 function doMain {
