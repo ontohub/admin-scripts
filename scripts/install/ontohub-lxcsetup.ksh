@@ -267,6 +267,8 @@ function postElasticsearch {
 	update-rc.d elasticsearch defaults 95 10
 	# misc interesting stuff: /etc/elasticsearch/{logging|elasticsearch}.yml
 
+	grep -q ^esearch /etc/services || \
+		print 'esearch\t\t9200/tcp\t\t\t# Elastic Search' >>/etc/services
 	service elasticsearch start
 }
 
