@@ -199,14 +199,16 @@ function updateRepo {
 /^version_minimum_revision:/ { H; x; i\hets_path:\
   - '"${HETS_DESTDIR}"'/bin/hets-server\
 hets_lib:\
-  - '"${HETS_DESTDIR}"'/lib/hets-server\
+  - '"${HETS_DESTDIR}"'/lib/hets-server/hets-lib\
 hets_owl_tools:\
   - '"${HETS_DESTDIR}"'/lib/hets-server/hets-owl-tools\
 
 }'			-i config/hets.yml
 		[[ -e lib/tasks/hets.rake ]] && \
 			sed -e '/HETS_CMD =/ s,hets ,hets-server ,' -i lib/tasks/hets.rake
-		sed -e '/system/ s,hets ,hets-server ,' -i lib/tasks/test.rake
+		sed -i -e '/system/ s,hets ,hets-server ,' -e '/strip/ s,hets`,hets-server`,' \
+			lib/tasks/test.rake
+		sed -i -e '/exec/ s,hets ,hets-server ,' config/god/hets_workers.rb
 
 		# See ~admin/etc/post-install2.sh (postGit()) - "COW"
 		sed -e "/#{config.git_user}/ s,=.*,= '${CFG[datadir]}'," \
@@ -441,7 +443,39 @@ function resetDb {
 	fi
 	~/bin/rake generate:metadata
 	~/bin/rake import:logicgraph
-	[[ -f lib/tasks/hets.rake ]] && ~/bin/rake hets:generate_first_instance
+	if [[ -f lib/tasks/hets.rake ]]; then
+		# Initially we have a chicken-and-egg-problem here: The ontohub-god
+		# service cannot be started, before the ontohub repo is checked out and
+		# prepared (done by this script). However this service is responsible for
+		# running a hets instance on port 8000, which is required to be able to
+		# 'rake hets:generate_first_instance'. So at least on a virign system we need
+		# to bootstrap, i.e. fire it up manually ... 
+		typeset X=${ pgrep -f bin/god ; }
+		if [[ -n $X ]]; then
+			Log.info 'Waiting for ontohub-god (hets-server) to come up ...'
+			integer SEC=60
+			while (( SEC > 0 )); do
+				X=${ print 'GET / HTTP/1.1\nHost: localhost\n' | \
+					netcat localhost 8000 ; }
+				[[ -n $X ]] && break
+				(( SEC-- ))
+				print -n '.'
+				sleep 1
+			done
+			print '.'
+		fi
+		if [[ -z $X ]]; then
+			Log.info 'Bootstrapping hets ...'
+			hets-server -X >/dev/null 2>&1 &
+			(( $? )) || X=$!
+		fi
+		if [[ -n $X ]]; then
+			~/bin/rake hets:generate_first_instance
+			[[ $X =~ ^[0-9]+ ]] && kill -9 $X
+		else
+			Log.warn 'Skipping "rake hets:generate_first_instance"'
+		fi
+	fi
 }
 
 function doMain {

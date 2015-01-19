@@ -315,12 +315,13 @@ function createUsers {
 			>>${ZROOT}/etc/passwd
 		print "${ZUSER[$U].login}:${ZUSER[$U].pw}:::::::" >>${ZROOT}/etc/shadow
 		if [[ ${ZUHOME} != '/' ]]; then
-			[[ -z ${ZUSER[$U].skeleton} || ! -d "${ZUSER[$U].skeleton}" || \
-				! -d "${ZROOT}/${ZUHOME}" ]] && continue
+			[[ -z ${ZUSER[$U].skeleton} || \
+				! -d ${ZROOT}/${ZUSER[$U].skeleton} || \
+				! -d ${ZROOT}/${ZUHOME} ]] && continue
 			# on Ubuntu pax is not POSIX conform and thus useless, i.e.
 			#pax -rwLlk -o gid=${ZUSER[$U].gid} -o uid=${ZUSER[$U].uid}
 			# does not work
-			( cd "${ZUSER[$U].skeleton}" && \
+			( cd "${ZROOT}/${ZUSER[$U].skeleton}" && \
 				find . -depth -print | cpio -puvmd "${ZROOT}/${ZUHOME}"
 			)
 			find ${ZROOT}/${ZUHOME} \( -type d -o -type f \) \

@@ -567,7 +567,8 @@ function installZone {
 }
 
 Man.addFunc customizeZone '' '[+NAME?customizeZone - customize the new zone image]
-[+DESCRIPTION?Applies our local customization to the zone image, i.e. it assumes, that the zone is not already running. (lxc specific)]
+[+DESCRIPTION?Applies our local customization to the zone image, i.e. it assumes, that the zone is NOT yet running (lxc specific). For now it just fetches the post install script from our central repo and execs it with the operand ${ZBASE}/${ZNAME} and finally adjusts \b/etc/security/limits.conf\b.]
+[+SEE ALSO?\bfetchPost()\b]
 '
 function customizeZone {
 	Log.info 'Fetching post-install script ...'
@@ -578,6 +579,40 @@ function customizeZone {
 	fi
 	print '*	soft	nofile	2048\n*	hard	nofile	16384' \
 		>>${ZROOT}/etc/security/limits.conf
+	Log.info 'Done.'
+}
+
+Man.addVar IPFCONF 'IP tables configuration template to use to populate \b/etc/init.d/iptables\b of the zone. Default: best match of \a$SDIR\a\b/files/iptables\b[{\b@\b\a$ZHNAME\a[\b.\b\a$ZDOMAIN\a]]|\b@\b\a$ZDOMAIN\a}]][\b@\b\a$MTYPE\a]].'
+
+Man.addFunc customizeRunningZone '' '[+NAME?customizeRunningZone - "standard" customization of a running zone]
+[+DESCRIPTION?Executes common actions usually required for every zone to customize it, adjust settings. This includes fixing bugs, adjusting service parameters and dependencies, populating the admin home and fixing configuration files.]
+[+?The following environment variables are refreshed to match the current settings of the zone: \bZHNAME\b, \bZIP\b, \bZDOMAIN\b, \bGW\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME ZHNAME GW ZIP ZVNIC ZDOMAIN ZPATH ADDSERVICE; }" '}
+[+SEE ALSO?\bzlogin\b(1), \bhostname\b(1), \bsvccfg\b(1M), \badjustSSH()\b, \bfixSendmail()\b, \bdisableIPv6()\b, \bsetupAdminHome()\b, \bipfilterFinal()\b]'
+function customizeRunningZone {
+	Log.info "Customizing zone $ZNAME ..."
+	if [[ -z ${IPFCONF} ]]; then
+		IPFCONF=${SDIR}/files/iptables
+		typeset TOCHECK="${ZHNAME}.${ZDOMAIN} ${ZHNAME} ${ZDOMAIN}"
+		for X in ${TOCHECK} ' '; do
+			[[ $X == ' ' ]] && X='' || X="@$X"
+			[[ -n ${MTYPE} && -r ${IPFCONF}${X}@${MTYPE} ]] && \
+				IPFCONF=${IPFCONF}${X}@${MTYPE} && break
+			[[ -r ${IPFCONF}$X ]] && IPFCONF=${IPFCONF}$X && break
+		done
+	fi
+	if [[ -n ${IPFCONF} && ! -r ${IPFCONF} ]]; then
+		[[ -r ${SDIR}/files/${IPFCONF} ]] \
+			&& IPFCONF=${SDIR}/files/${IPFCONF} || IPFCONF=''
+	fi
+	if [[ -z ${IPFCONF} ]]; then
+		Log.info 'No suitable iptables template found. Skipping iptables setup.'
+	else
+		Log.info "Using iptables template ${IPFCONF} ..."
+		cp -p ${IPFCONF} ${ZROOT}/etc/init.d/iptables
+		chmod 755 ${ZROOT}/etc/init.d/iptables
+		zlogin ${ZNAME} /usr/sbin/update-rc.d iptables defaults
+	fi
 	Log.info 'Done.'
 }
 
@@ -606,6 +641,56 @@ function bootZone {
 		return 2
 	fi
 	Log.info 'Done.'
+}
+
+Man.addFunc rebootZone '' '[+NAME?rebootZone - reboot the zone and wait until ssh service has been started]
+[+DESCRIPTION?Reboots the zone and waits until it is up again, i.e. the ssh service of the zone is running.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME; }" '}
+[+SEE ALSO?\bzoneadm\b(1M), \bzlogin\b(1)]
+'
+function rebootZone {
+	typeset STATE=
+	integer TIMEOUT=120 PID
+
+	Log.info 'Rebooting zone ...'
+	SECONDS=0
+	+ lxc-stop -r -P /tmp -n tb >/dev/null 2>&1 &
+	PID=$!
+	while [[ -n ${ ps -h -p ${PID} ; } ]]; do
+		print -n '.'
+		sleep 1
+		(( TIMEOUT-- ))
+		(( TIMEOUT < 1 )) && break
+	done
+		
+	while [[ -z ${STATE} ]]; do
+		print -n '.'
+		sleep 1
+		STATE=${ zlogin ${ZNAME} pgrep -P 1 -f 'sshd -D' 2>/dev/null ; }
+		(( TIMEOUT-- ))
+		if (( TIMEOUT < 0 )); then
+			print
+			Log.warn 'Reboot failed (timeout to come up reached).'
+			return
+		fi
+	done
+	print "${SECONDS}s"
+	Log.info 'Done.'
+}
+
+Man.addFunc haltZone '' '[+NAME?haltZone - halt the zone when the ENTER key gets pressed.]
+[+DESCRIPTION?Once called it waits until the ENTER key gets pressed. After that it halts the zone. Usually (if not testing zone setup scripts) one should avoid this big hammer and use "+ zlogin \a$ZNAME\a init 5" instead.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME; }" '}
+[+SEE ALSO?\bzoneadm\b(1M), \bread\b(1), \brebootZone()\b]
+'
+function haltZone { 
+	typeset LINE
+	Log.info 'Press <ENTER> to halt the zone ...'
+	read LINE
+
+	Log.info 'Halting zone ...'
+	lxc-stop -n ${ZNAME} -P ${ZBASE}
+	(( $? )) && Log.fatal 'failed.' || Log.info 'Done.'
 }
 
 Man.addFunc destroyZone '' '[+NAME?destroyZone - halt, uninstall the zone and delete its configuration.]
@@ -649,6 +734,12 @@ function zlogin {
 	lxc-attach -n ${ZONE} -P ${ZBASE} --clear-env -- "$@"
 }
 
+#. ${LIBNAME%/*}/zcustomize.kshlib - for LXC we have this in post install
+. ${LIBNAME%/*}/zskeleton.kshlib
+
+##############################################################################
+# main
+##############################################################################
 function showUsage {
     if [[ $2 != LIBX ]]; then
         getopts -a "$1" "${ print ${Man.FUNC[$2]}; }" OPT --man

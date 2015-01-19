@@ -128,50 +128,69 @@ Man.addFunc getDefaultIfAndMac '' '[+NAME?getDefaultIfAndMac - determine the def
 [+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DEFAULTIF MAC_PREFIX MAC; }" '}
 [+SEE ALSO?\broute\b(1M), \bipadm\b(1M), \bdladm\b(1M), \bhostname\b(1)]'
 function getDefaultIfAndMac {
-	typeset X IP A
+	typeset X IP A KEY VAL TAIL F
+	typeset -A ZMACS
 	MAC=''
 	X=( ${ ip route show match default 2>/dev/null ; } )
 	(( ${#X[@]} >= 5 )) && DEFAULTIF="${X[4]}"
-	if [[ -n ${DEFAULTIF} ]]; then
-		X=( ${ ip addr show ${DEFAULTIF} 2>/dev/null; } )
-		IP="${X[@]}"
-		if [[ ${IP} =~ \ inet\  ]]; then
-			X=${IP#*inet }
-			IP=${X%%/*}
-			typeset -a -i B=( ${IP//./ } )
-			integer K=0
-			typeset -A ZBASES
-			ZBASES[${ZBASE}]=1
-			# auto detect zones with a different lxc.path
-			while read -A A ; do
-				X="${A[7]}"
-				[[ ${X:0:1} == '@' && ${X: -8} == '/command' ]] || continue
-				X="${X:1:${#X}-9}"
-				[[ -f $X/config ]] && ZBASES[${X%/*}]=1
-			done </proc/net/unix
-			# count configured zones
-			for A in ${!ZBASES[@]} ; do
-				for X in ~(N)$A/*/config ; do
-					[[ -n $X ]] && (( K++ ))
-				done
-			done
-			(( K++ ))
-			if (( K < 16 )); then
-				(( K*=16 ))
-			elif (( K < 32 )); then
-				(( K*=8 ))
-			elif (( K < 64 )); then
-				(( K*=4 ))
-			else
-				(( K=(RANDOM & 255) ))
-			fi
+	[[ -z ${DEFAULTIF} ]] && DEFAULTIF=${ hostname; }0 && return
 
-			# 11.1 accepts zero padded mac addresses, only
-			MAC=${ printf "%s:%02x:%02x:%02x" $MAC_PREFIX ${B[2]} ${B[3]} $K; }
-		fi
+	X=( ${ ip addr show ${DEFAULTIF} 2>/dev/null; } )
+	IP="${X[@]}"
+	[[ ${IP} =~ \ inet\  ]] || return
+
+	X=${IP#*inet }
+	IP=${X%%/*}
+	typeset -a -i B=( ${IP//./ } )
+	typeset -A ZBASES
+	ZBASES[${ZBASE}]=1
+	# auto detect zones with a different lxc.path
+	while read -A A ; do
+		X="${A[7]}"
+		[[ ${X:0:1} == '@' && ${X: -8} == '/command' ]] || continue
+		X="${X:1:${#X}-9}"
+		[[ -f $X/config ]] && ZBASES[${X%/*}]=1
+	done </proc/net/unix
+
+	# Count configured zones and record their macs. LXC is crap here, since we
+	# cannot see how VNICs are configured within the NGZs and can't just LL
+	# configure them in the GZ and inherit them LL pre-configured to the NGZ 
+	integer I K N O
+	for A in ${!ZBASES[@]} ; do
+		for X in ~(N)$A/*/config ; do
+			while read KEY TAIL VAL TAIL ; do
+				[[ ${KEY} == 'lxc.network.hwaddr' ]] || continue
+				F=( ${VAL//:/ } )
+				for (( I=0; I < ${#F[@]} ; I++ )); do
+					[[ ${#F[I]} < 2 ]] && F[$I]="0${F[I]}"
+				done
+				VAL="${F[@]}"
+				ZMACS["${VAL// /:}"]=1
+				break
+			done <"$X"
+		done
+	done
+	N=${#ZMACS[@]}
+	(( N++ ))
+	if (( N < 16 )); then
+		O=16
+	elif (( N < 32 )); then
+		O=8
+	elif (( N < 64 )); then
+		O=4
 	else
-		DEFAULTIF=${ hostname; }0
+		(( K=(RANDOM & 255) ))
+		# 11.1 accepts zero padded mac addresses, only
+		MAC=${ printf "%s:%02x:%02x:%02x" $MAC_PREFIX ${B[2]} ${B[3]} $K; }
+		return
 	fi
+
+	K=O
+	for (( I=0; I < N ; I++ )); do
+		MAC=${ printf "%s:%02x:%02x:%02x" $MAC_PREFIX ${B[2]} ${B[3]} $K; }
+		[[ -z ${ZMACS[${MAC}]} ]] && break
+		(( K+=O ))
+	done
 }
 
 Man.addFunc normalizeMac '' '[+NAME?normalizeMac - normalize a MAC address]

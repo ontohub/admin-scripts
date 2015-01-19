@@ -1,0 +1,113 @@
+# The contents of this file are subject to the terms of the
+# Common Development and Distribution License (the "License")
+# (see http://www.opensource.org/licenses/CDDL-1.0).
+#
+# Copyright (c) 2011, 2012 Jens Elkner. All rights reserved.
+# Use is subject to license terms.
+
+Man.addFunc skeleton '' '[+NAME?skeleton - print out a standard zonesetup script.]
+[+DESCRIPTION?Prints a standard zonesetup to stdout which might be used as a skeleton/base for a customized zone.]
+[x:extended?Include function description and other comments].'
+function skeleton {
+	typeset X="$LIBNAME" EOL='\n' OPT 
+	typeset -a C E
+	integer COMMENT=0 I
+	X=${X#$SDIR/}
+	if [[ $X != $LIBNAME ]]; then
+		Y="#. $LIBNAME"' || exit 1\n'
+		# If directly called, we do not have any hint to determine this dir
+		# relative to the resulting scripts dir. So assume it is in ./etc/
+		[[ $SCRIPT == $LIBNAME ]] && X='$SDIR/etc/'"$X" || X='$SDIR/'"$X"
+	fi
+	getopts -a $0 "${ print ${Man.FUNC[$0]}; }" OPT
+	[[ $OPT == x ]] && COMMENT=1 && EOL=''
+
+	print '#!/bin/ksh93'
+
+	Man.printVarComment $COMMENT 'SDIR'
+	print $EOL'SDIR=$( cd ${ dirname $0; }; print -n "$PWD" )'
+
+	#Man.printVarComment $COMMENT LIBNAME		# not really appropriate here
+	(( $COMMENT )) && print '\n# Load the library, initialize defaults and process remaining arguments.'
+	print $EOL"$Y. $X || exit 1"
+	print '\n# Your current working directory (CWD) is now $SDIR\n'
+
+	Man.printVarComment $COMMENT 'ZUSER'
+	Man.printTypeFieldComments $COMMENT 'UserObj_t'
+
+	Man.printVarComment $COMMENT 'DATADIR'
+	Man.printTypeFieldComments $COMMENT 'DatadirObj_t'
+
+	C[0]='#\n# Examples:\n# Just inherit the dataset rpool/$ZNAME/pool1 from the global zone as pool1\n# into the non-global zone:'
+	E[0]='#\tDATADIR[pool1]=( pool=rpool/$ZNAME/pool1 z_pool=pool1 )\t\t# dataset'
+	C[1]='#\n# Mount the ZFS pool2/$ZNAME/httpd from the global zone at the directory\n# /data/httpd in the non-global zone:'
+	E[1]='#\tDATADIR[http]=( pool=pool1/$ZNAME/pkg z_dir=/data/httpd )\t# zfs mount'
+	C[2]='#\n# Mount the directory /usr/share/vim/vim73 from the global zone at the directory\n# /usr/share/vim/vim73 in the non-global zone:'
+	E[2]='#\tDATADIR[vim]=( dir=/usr/share/vim/vim73 \\\n#\t\tz_dir=/usr/share/vim/vim73 mopts="ro nodevices" )\t\t# lofs mount'
+	for I in {0..2}; do
+		(( $COMMENT )) && print "${C[$I]}"
+		print "${E[$I]}"
+	done
+	print
+	
+	Man.printFuncComment $COMMENT 'checkNIC'
+	print 'checkNIC\n'
+
+	Man.printFuncComment $COMMENT 'checkIP'
+	print 'checkIP\n'
+
+	Man.printFuncComment $COMMENT 'checkDatadirsPre'
+	print 'checkDatadirsPre\n'
+
+	Man.printFuncComment $COMMENT 'checkZonePathes'
+	print 'checkZonePathes\n'
+
+	Man.printFuncComment $COMMENT 'createTempdir'
+	print 'createTempdir\n'
+
+	if [[ ${ uname -s ; } == 'SunOS' ]]; then
+		Man.printVarComment $COMMENT 'MANIFEST' && print
+		Man.printFuncComment $COMMENT 'prepareManifest'
+		print 'prepareManifest\n'
+
+		(( $COMMENT )) && print '# Get back the 'Primary Administrator' profile as a package. Whether this or
+# the only use of the sudo-Brack is more secure, certainly depends on your 
+# own  point of view / experience ...
+# Set the publisher if needed:  pkg set-publisher -g http://pkg.cs.ovgu.de/lnf/ '
+		print 'addPkg install //lnf/primary-admin\n'
+
+		Man.printFuncComment $COMMENT 'prepareProfiles'
+		print 'prepareProfiles\n'
+	fi
+
+	Man.printFuncComment $COMMENT 'createZoneConfig'
+	print 'createZoneConfig\n'
+
+	Man.printFuncComment $COMMENT 'installZone'
+	print 'installZone || exit $?\n'
+
+	if [[ ${ uname -s ; } == 'SunOS' ]]; then
+		Man.printFuncComment $COMMENT 'addPrimaryAdministrator'
+		print '#addPrimaryAdministrator\n'
+	elif [[ ${ uname -s ; } == 'Linux' ]]; then
+		Man.printFuncComment $COMMENT 'customizeZone'
+		print 'customizeZone || exit $?\n'
+	fi
+
+	Man.printFuncComment $COMMENT 'bootZone'
+	print 'bootZone || exit $?\n'
+
+	Man.printFuncComment $COMMENT 'checkDatadirsPost'
+	print 'checkDatadirsPost || exit $?\n'
+
+	Man.printFuncComment $COMMENT 'customizeRunningZone'
+	print 'customizeRunningZone\n'
+
+	Man.printFuncComment $COMMENT 'rebootZone'
+	print 'rebootZone'
+
+	(( $COMMENT )) && print '\n# As an alternative one may pull the plug:'
+	Man.printFuncComment $COMMENT 'haltZone'
+	print '#haltZone'
+}
+# vim:ts=4 filetype=sh

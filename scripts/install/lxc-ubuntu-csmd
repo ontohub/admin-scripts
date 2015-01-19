@@ -38,7 +38,12 @@ unset SOPT DEFAULT MIRROR SECURITY_MIRROR ; typeset -A SOPT DEFAULT
 # Miniroot packages, only. Any change here requires '-f' to reflect changes!
 # The previous/packaged ubuntu template honors packages_template env var :(
 # for whatever reason. So to be compatible ...
-A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils acl -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
+# ulogd2 is needed for proper iptables logging via -j NFLOG. If one uses just
+# -j LOG iptables logging becomes absolutely unreliable, i.e. some log msg
+# never show up in any log and log messages from the GZ ends up in a zone's
+# log, but one can't control into which one it goes (appears to be randomly
+# distrubuted over all zones).
+A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils acl iptables ulogd2 -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
 X="${A[*]}"
 unset A
 
@@ -263,10 +268,16 @@ function download_ubuntu {
 		return 3	# JEL-TBD: hmm, really?
 	fi
 
-	[[ ! -x /usr/sbin/root ]] && UPKGS=${UPKGS// sudo / } || \
-		typeset -x SUDO_FORCE_REMOVE=yes
+	# If + is n/a, don't uninstall sudo
+	[[ ! -x /usr/sbin/root ]] && UPKGS=${UPKGS// sudo / }
 
-	chroot ${TMPROOT} apt-get purge -y ${UPKGS}
+	Log.info "Trying to remove from miniroot '${UPKGS//  / }'"
+	print '#!/bin/ksh93\nexport SUDO_FORCE_REMOVE=yes' \
+		"\nprint 'Yes, do as I say!' | apt-get purge --force-yes -y ${UPKGS}" \
+		>${TMPROOT}/var/tmp/pkgrm
+	chmod 755 ${TMPROOT}/var/tmp/pkgrm
+	chroot ${TMPROOT} /var/tmp/pkgrm && \
+		Log.info 'Done.' || Log.warn "Failed with exit code $?"
 
 	if [[ -x /usr/sbin/root && ! -e ${TMPROOT}/usr/sbin/root ]]; then
 		cp /usr/sbin/root ${TMPROOT}/usr/sbin/root

@@ -111,6 +111,15 @@ createZoneConfig
 installZone || exit $?
 customizeZone || exit $?
 
+F="${SDIR}/files/ssh_keys/authorized_keys.bremen"
+if [[ -f $F ]]; then
+	# neither git nor redis or ruby!
+	for X in admin ontohub ; do
+		[[ ! -d ${ZROOT}/${ZUSER[$X].home}/.ssh ]] && continue
+		cat "$F" >>${ZROOT}/${ZUSER[$X].home}/.ssh/authorized_keys2
+	done
+fi
+
 # customizations, which do not require a running/fully plumbed zone
 sed -e '/^export APACHE_RUN_USER=/ s,=.*,=webservd,' \
 	-e '/^export APACHE_RUN_GROUP=/ s,=.*,=webservd,' \
@@ -118,14 +127,11 @@ sed -e '/^export APACHE_RUN_USER=/ s,=.*,=webservd,' \
 
 bootZone || exit $?
 checkDatadirsPost
+customizeRunningZone
 
 # sometimes one may need to switch over to webservd for testing
 [[ ${BRANCH} != 'master' ]] && \
 	sed -re '/^webservd:/ s,:[^:]+$,:/bin/bash,' -i ${ZROOT}/etc/passwd
-
-# and of course we are not paranoid
-chmod a+r ${ZROOT}/var/log/{dmesg,dmesg.*,kern.log,syslog} \
-	${ZROOT}/var/log/upstart/*
 
 # To avoid a chroot marathon we simply xfer the following functions as script
 # as well as supporting scripts into the zone and run it there.
@@ -363,6 +369,18 @@ cd ${REPO} || exit 1
 [[ -e log ]] || ln -s ${HOME}/log log
 
 export RAILS_ENV HOME
+#X=${ whence hets ; }
+#if [[ -z $X ]]; then
+#	if [[ ! -e ${HOME}/bin/hets ]]; then
+#		X=${ whence hets-server ; }
+#		if [[ -n $X ]]; then
+#			ln -s $X ${HOME}/bin/hets
+#		else
+#			print -u2 "Warnig: hets-server not found - might become a problem"
+#		fi
+#	fi
+#	export PATH=${HOME}/bin:${PATH}
+#fi
 
 if [[ $1 == "start" ]]; then
 	shift
@@ -1377,6 +1395,5 @@ print "${ZSCRIPT}" >${ZROOT}/local/home/admin/etc/post-install2.sh
 # fire the postinstall stuff inside
 zlogin ${ZNAME} /bin/ksh93 /local/home/admin/etc/post-install2.sh postInstall
 
-Log.info 'Zone should be up and running.'
-
+rebootZone
 # vim: ts=4 sw=4 filetype=sh
