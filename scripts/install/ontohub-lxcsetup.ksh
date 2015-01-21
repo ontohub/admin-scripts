@@ -79,6 +79,9 @@ DATADIR[redis]=(
 DATADIR[psql]=(
 	z_pool=pool2/data/psql z_dir=/data/psql
 	mode=8#0755 uid=${PSQL_UID} gid=${PSQL_GID} )
+# lofs
+DATADIR[netbackup]=( dir=/usr/openv z_dir=/usr/openv mopts="ro" )
+
 
 checkDatadirsPre
 checkIP
@@ -111,15 +114,6 @@ createZoneConfig
 installZone || exit $?
 customizeZone || exit $?
 
-F="${SDIR}/files/ssh_keys/authorized_keys.bremen"
-if [[ -f $F ]]; then
-	# neither git nor redis or ruby!
-	for X in admin ontohub ; do
-		[[ ! -d ${ZROOT}/${ZUSER[$X].home}/.ssh ]] && continue
-		cat "$F" >>${ZROOT}/${ZUSER[$X].home}/.ssh/authorized_keys2
-	done
-fi
-
 # customizations, which do not require a running/fully plumbed zone
 sed -e '/^export APACHE_RUN_USER=/ s,=.*,=webservd,' \
 	-e '/^export APACHE_RUN_GROUP=/ s,=.*,=webservd,' \
@@ -132,6 +126,20 @@ customizeRunningZone
 # sometimes one may need to switch over to webservd for testing
 [[ ${BRANCH} != 'master' ]] && \
 	sed -re '/^webservd:/ s,:[^:]+$,:/bin/bash,' -i ${ZROOT}/etc/passwd
+
+F="${SDIR}/files/ssh_keys/authorized_keys.bremen"
+if [[ -f $F ]]; then
+	Log.info 'Adding authorized_keys.bremen ...'
+	# neither git nor redis or ruby!
+	for X in /local/home/admin ${ZUSER[ontohub].home} ; do
+		if [[ ! -d ${ZROOT}/$X/.ssh ]]; then
+			mkdir ${ZROOT}/$X/.ssh || continue
+			chmod 0755 ${ZROOT}/$X/.ssh
+		fi
+		cat "$F" >>${ZROOT}/$X/.ssh/authorized_keys2
+	done
+	Log.info 'Done.'
+fi
 
 # To avoid a chroot marathon we simply xfer the following functions as script
 # as well as supporting scripts into the zone and run it there.

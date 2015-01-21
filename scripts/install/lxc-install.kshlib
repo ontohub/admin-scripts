@@ -654,7 +654,7 @@ function rebootZone {
 
 	Log.info 'Rebooting zone ...'
 	SECONDS=0
-	+ lxc-stop -r -P /tmp -n tb >/dev/null 2>&1 &
+	lxc-stop -r -P ${ZBASE} -n ${ZNAME} >/dev/null 2>&1 &
 	PID=$!
 	while [[ -n ${ ps -h -p ${PID} ; } ]]; do
 		print -n '.'

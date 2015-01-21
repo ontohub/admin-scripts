@@ -464,7 +464,7 @@ function checkDatadirsPre {
 			# need to do in post
 			(( CMASK == 1 )) && DS.fstype=DIR || DS.fstype=LOCAL
 		else # 2#0100|2#0101
-			[[ ! -d ${DS.dir} ]] && mkdir -p ${DS.dir} || exit 3
+			[[ ! -d ${DS.dir} ]] && { mkdir -p ${DS.dir} || exit 3 ; }
 			setDirPermissions 'global' "${DS.dir}" ${KEY}
 			(( CMASK == 2#0101 )) && DS.fstype=LOFS || DS.fstype=DIR
 		fi
@@ -636,7 +636,7 @@ function addDataDirs2lxc {
 	# correctly, however, this hasn't been tested yet (ZoL n/a).
 	# So USE_ZFS support needs plumbing + state of ZoL impl. research
 	typeset -n CFG=$1 HOOK=$2
-	typeset KEY
+	typeset KEY OPTS
 	typeset -i2 CMASK
 	typeset -l FSTYPE
 	for KEY in ${!DATADIR[*]}; do
@@ -644,17 +644,19 @@ function addDataDirs2lxc {
 		#DS.dump
 		FSTYPE=${DS.fstype}
 		CMASK=${ DS.getMask; }
+		OPTS='rbind'
+		[[ -n ${DS.mopts} ]] && OPTS+=",${DS.mopts//+([[:space:]])/,}"
 		if (( CMASK == 2#0011 )); then
 			(( USE_ZFS )) && Log.warn 'Unsupported case NGZ_zfs->NGZ_dir' || \
-				HOOK+="/${DS.z_pool}\t${DS.z_dir}\tnone\trbind\t0 2\n"
+				HOOK+="/${DS.z_pool}\t${DS.z_dir}\tnone\t${OPTS}\t0 2\n"
 		elif (( CMASK == 2#0101 )); then	# GZ_dir->NGZ_dir
-			CFG+="${DS.dir}\t${DS.z_dir#/}\tnone\trbind\t0 2\n"
+			CFG+="${DS.dir}\t${DS.z_dir#/}\tnone\t${OPTS}\t0 2\n"
 		elif (( CMASK == 2#1001 )); then
 			(( USE_ZFS )) && Log.warn 'Unsupported case GZ_zfs->NGZ_dir' || \
-				CFG+="/${DS.pool}\t${DS.z_dir#/}\tnone\trbind\t0 2\n"
+				CFG+="/${DS.pool}\t${DS.z_dir#/}\tnone\t${OPTS}\t0 2\n"
 		elif (( CMASK == 2#1010 )); then
 			(( USE_ZFS )) && Log.warn 'Unsupported case GZ_zfs->NGZ_zfs' || \
-				CFG+="/${DS.pool}\t${DS.z_pool}\tnone\trbind\t0 2\n"
+				CFG+="/${DS.pool}\t${DS.z_pool}\tnone\t${OPTS}\t0 2\n"
 		fi
 	done
 }
