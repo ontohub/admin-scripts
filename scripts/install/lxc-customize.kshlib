@@ -1,0 +1,79 @@
+Man.addVar IPFCONF 'IP tables configuration template to use to populate \b/etc/init.d/iptables\b of the zone. Default: best match of \a$SDIR\a\b/files/iptables\b[{\b@\b\a$ZHNAME\a[\b.\b\a$ZDOMAIN\a]]|\b@\b\a$ZDOMAIN\a}]][\b@\b\a$MTYPE\a]].'
+
+function fixIptables {
+	if [[ -z ${IPFCONF} ]]; then
+		IPFCONF=${SDIR}/files/iptables
+		typeset TOCHECK="${ZHNAME}.${ZDOMAIN} ${ZHNAME} ${ZDOMAIN}"
+		for X in ${TOCHECK} ' '; do
+			[[ $X == ' ' ]] && X='' || X="@$X"
+			[[ -n ${MTYPE} && -r ${IPFCONF}${X}@${MTYPE} ]] && \
+				IPFCONF=${IPFCONF}${X}@${MTYPE} && break
+			[[ -r ${IPFCONF}$X ]] && IPFCONF=${IPFCONF}$X && break
+		done
+	fi
+	if [[ -n ${IPFCONF} && ! -r ${IPFCONF} ]]; then
+		[[ -r ${SDIR}/files/${IPFCONF} ]] \
+			&& IPFCONF=${SDIR}/files/${IPFCONF} || IPFCONF=''
+	fi
+	if [[ -z ${IPFCONF} ]]; then
+		Log.info 'No suitable iptables template found. Skipping iptables setup.'
+	else
+		Log.info "Using iptables template ${IPFCONF} ..."
+		cp -p ${IPFCONF} ${ZROOT}/etc/init.d/iptables
+		chmod 755 ${ZROOT}/etc/init.d/iptables
+		zlogin ${ZNAME} /usr/sbin/update-rc.d iptables defaults
+	fi
+}
+
+function fixNetbackup {
+	if [[ -x ${ZROOT}/usr/openv/netbackup/bin/update_config ]]; then
+		zlogin ${ZNAME} /usr/openv/netbackup/bin/update_config -i
+		cd /var/tmp
+		rm -f netbackup-client-svcs.deb
+		wget http://pkg/LNF/linux/ubuntu/netbackup-client-svcs.deb
+		if [[ ${ file netbackup-client-svcs.deb ; } =~ Debian\ binary ]]; then
+			cp -p netbackup-client-svcs.deb ${ZROOT}/var/tmp/
+			zlogin ${ZNAME} dpkg -i /var/tmp/netbackup-client-svcs.deb
+		fi
+	fi
+	[[ -e ${ZROOT}/etc/netbackup/bp.conf ]] && \
+		sed -e '/@SERVER_NAME@/ { g; a\SERVER = arche.urz.uni-magdeburg.de\
+SERVER = vian.urz.uni-magdeburg.de\
+SERVER = clarke.urz.uni-magdeburg.de
+}' \
+			-e "s,@NODE_NAME@,${ZHNAME}.${ZDOMAIN}," \
+			-e '/^#USEMAIL/ s,^.*,USEMAIL =,' \
+			-e '/^#SERVER_SENDS_MAIL/ s,^.*,SERVER_SENDS_MAIL = NO,' \
+			-e "/^LOCALMAIL/ s,=.*,= backup@${ZDOMAIN}," \
+			-e '/^#VERBOSE/ a\#bpbkar_VERBOSE = 5' \
+			-i ${ZROOT}/etc/netbackup/bp.conf
+
+	# a default exclude_list comes in with "update_config -i". However, there
+	# might be a FQDN|hostname|domain specific one:
+	typeset X EXCLUDES="${SDIR}/files/exclude_list"
+	for X in ${ZHNAME}.${ZDOMAIN} ${ZHNAME} ${ZDOMAIN} ; do
+		[[ -r ${EXCLUDES}@$X ]] && EXCLUDES+="@$X" && X='@' && break
+	done
+	# even if netbackup svcs are not yet installed, IF a specific exclude_list
+	# exists, we copy it over
+	if [[ $X == '@' ]]; then
+		[[ -d /etc/netbackup ]] && mkdir /etc/netbackup
+		cp "${EXCLUDES}" ${ZROOT}/etc/netbackup/exclude_list
+	fi
+}
+
+Man.addFunc customizeRunningZone '' '[+NAME?customizeRunningZone - "standard" customization of a running zone]
+[+DESCRIPTION?Executes common actions usually required for every zone to customize it, adjust settings. This includes fixing bugs, adjusting service parameters and dependencies, populating the admin home and fixing configuration files.]
+[+?The following environment variables are refreshed to match the current settings of the zone: \bZHNAME\b, \bZIP\b, \bZDOMAIN\b, \bGW\b.]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME ZHNAME GW ZIP ZVNIC ZDOMAIN ZPATH ADDSERVICE; }" '}
+[+SEE ALSO?\bzlogin\b(1), \bhostname\b(1), \bsvccfg\b(1M), \badjustSSH()\b, \bfixSendmail()\b, \bsetupAdminHome()\b, \bfixIptables()\b, \bfixNetbackup()\b ]'
+function customizeRunningZone {
+	Log.info "Customizing zone $ZNAME ..."
+
+	fixIptables
+	fixNetbackup
+
+	Log.info 'Done.'
+}
+
+# vim: ts=4 sw=4 filetype=sh
