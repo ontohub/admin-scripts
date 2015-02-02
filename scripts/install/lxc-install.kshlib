@@ -15,7 +15,8 @@ Man.addVar SDIR 'Base directory which contains all relevant files (manifests, pr
 cd $SDIR
 
 . ${LIBNAME%/*}/utils.kshlib
-
+[[ -r ${LIBNAME%/*}/lxc-customize.kshlib ]] && \
+	. ${LIBNAME%/*}/lxc-customize.kshlib
 
 ############################################################################
 # main environment
@@ -567,7 +568,7 @@ function installZone {
 }
 
 Man.addFunc customizeZone '' '[+NAME?customizeZone - customize the new zone image]
-[+DESCRIPTION?Applies our local customization to the zone image, i.e. it assumes, that the zone is NOT yet running (lxc specific). For now it just fetches the post install script from our central repo and execs it with the operand ${ZBASE}/${ZNAME} and finally adjusts \b/etc/security/limits.conf\b.]
+[+DESCRIPTION?Applies our local customization to the zone image, i.e. it assumes, that the zone is NOT yet running (lxc specific). For now it just fetches the post install script from our central repo and execs it with the operand ${ZBASE}/${ZNAME} and finally adds \b/etc/security/limits.d/defaultsconf\b.]
 [+SEE ALSO?\bfetchPost()\b]
 '
 function customizeZone {
@@ -578,42 +579,39 @@ function customizeZone {
 		${TMPDIR}/post.sh ${ZBASE}/${ZNAME}
 	fi
 	print '*	soft	nofile	2048\n*	hard	nofile	16384' \
-		>>${ZROOT}/etc/security/limits.conf
+		>>${ZROOT}/etc/security/limits.d/defaults.conf
 	Log.info 'Done.'
 }
 
-Man.addVar IPFCONF 'IP tables configuration template to use to populate \b/etc/init.d/iptables\b of the zone. Default: best match of \a$SDIR\a\b/files/iptables\b[{\b@\b\a$ZHNAME\a[\b.\b\a$ZDOMAIN\a]]|\b@\b\a$ZDOMAIN\a}]][\b@\b\a$MTYPE\a]].'
-
-Man.addFunc customizeRunningZone '' '[+NAME?customizeRunningZone - "standard" customization of a running zone]
-[+DESCRIPTION?Executes common actions usually required for every zone to customize it, adjust settings. This includes fixing bugs, adjusting service parameters and dependencies, populating the admin home and fixing configuration files.]
-[+?The following environment variables are refreshed to match the current settings of the zone: \bZHNAME\b, \bZIP\b, \bZDOMAIN\b, \bGW\b.]
-[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage ZNAME ZHNAME GW ZIP ZVNIC ZDOMAIN ZPATH ADDSERVICE; }" '}
-[+SEE ALSO?\bzlogin\b(1), \bhostname\b(1), \bsvccfg\b(1M), \badjustSSH()\b, \bfixSendmail()\b, \bdisableIPv6()\b, \bsetupAdminHome()\b, \bipfilterFinal()\b]'
-function customizeRunningZone {
-	Log.info "Customizing zone $ZNAME ..."
-	if [[ -z ${IPFCONF} ]]; then
-		IPFCONF=${SDIR}/files/iptables
-		typeset TOCHECK="${ZHNAME}.${ZDOMAIN} ${ZHNAME} ${ZDOMAIN}"
-		for X in ${TOCHECK} ' '; do
-			[[ $X == ' ' ]] && X='' || X="@$X"
-			[[ -n ${MTYPE} && -r ${IPFCONF}${X}@${MTYPE} ]] && \
-				IPFCONF=${IPFCONF}${X}@${MTYPE} && break
-			[[ -r ${IPFCONF}$X ]] && IPFCONF=${IPFCONF}$X && break
-		done
-	fi
-	if [[ -n ${IPFCONF} && ! -r ${IPFCONF} ]]; then
-		[[ -r ${SDIR}/files/${IPFCONF} ]] \
-			&& IPFCONF=${SDIR}/files/${IPFCONF} || IPFCONF=''
-	fi
-	if [[ -z ${IPFCONF} ]]; then
-		Log.info 'No suitable iptables template found. Skipping iptables setup.'
-	else
-		Log.info "Using iptables template ${IPFCONF} ..."
-		cp -p ${IPFCONF} ${ZROOT}/etc/init.d/iptables
-		chmod 755 ${ZROOT}/etc/init.d/iptables
-		zlogin ${ZNAME} /usr/sbin/update-rc.d iptables defaults
-	fi
-	Log.info 'Done.'
+typeset -r POST_ISCRIPT='/local/home/admin/etc/post-install2.sh'
+Man.addFunc createPostInstall '' '[+NAME?createPostInstall - create a postInstall script to run within a zone]
+[+DESCRIPTION?Creates a simple ksh93 postInstall script by putting the given variables with its current values and after that the given functions into the script. However, the order of the variable and function definititions within the new script might be different. The env var section is enclosed by "# @VARS@" and "#@VARS_END@", the function section by "# @FN@" and "#@FN_END@" all on a separate line.]
+[e:env]:[list?A comma separated list of global environment variable names, which need to be included as global variables into the resulting script. This option can be used multiple times. \bZNAME\b, \bZHNAME\b, \bZDOMAIN\b, \bZIP\b, \bZNMASK\b and \bLNX_CODENAME\b are always included first.]
+[f:fn]:[list?A comma separated list of function names to put into the script. The functions must be defined in the current scope, i.e. when this function gets called. This option can be used multiple times.]
+[s:script]:[file?The full filename of the resulting script wrt. the / of the zone. Default: POST_ISCRIPT='"${POST_ISCRIPT}"']
+'
+function createPostInstall {
+	typeset S="${POST_ISCRIPT}" F X
+	typeset -A FN EN
+	X="${ print ${Man.FUNC[$0]}; }"
+	while getopts "${X}" option ; do
+		case "$option" in
+			e) for F in ${OPTARG//,/ } ; do EN[$F]=1 ; done  ;;
+			f) for F in ${OPTARG//,/ } ; do FN[$F]=1 ; done  ;;
+			s) S="${OPTARG}" ;;
+		esac
+	done
+	X='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\n# @VARS@\n'
+	X+="${ typeset -p ZNAME ZHNAME ZDOMAIN ZIP ZNMASK LNX_CODENAME ${!EN[@]}; }"
+	print "$X\n# @VARS_END@\n\n# @FN@" >"${ZROOT}/$S" || return $?
+	F="${!FN[@]}"
+	[[ -n $F ]] && typeset -f -p $F >>"${ZROOT}/$S"
+	print '# @FN_END@\n
+#typeset -ft ${ typeset +f ; }\n
+[[ -z $1 ]] && Log.fatal "Usage: $0 {'"${F// /|}"'}" && exit 1
+$1
+'		>>"${ZROOT}/$S"
+	chmod 0755 "${ZROOT}/$S"
 }
 
 Man.addFunc bootZone '' '[+NAME?bootZone - boot the zone and wait until it is running]

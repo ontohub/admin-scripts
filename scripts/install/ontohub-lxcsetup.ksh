@@ -92,7 +92,6 @@ createTempdir
 addPkg install	sudo					# Till wills haben
 addPkg install	apache2 apache2-utils	# web frontend
 addPkg install	postgresql				# DB
-addPkg install	ca-certificates			# let git work correctly
 addPkg install	git						# ontology repo management
 addPkg install	fonts-liberation		# includes best non-prop. font ever seen
 # hours of work: ruby does not say, that it needs readline, but actually
@@ -1335,7 +1334,7 @@ function postInit {
 	INIT=1
 }
 
-function postInstall {
+function postInstall2 {
 	Log.info "Running $0 ..."
 	typeset F X PKGS='redis-server hets-server-core'
 
@@ -1384,24 +1383,19 @@ GITDATA=${DATADIR[git].z_dir}
 SITEDIR=/${DATADIR[httpd].z_pool#*/}/${ZNAME}.${ZDOMAIN}
 integer HAS_SOLR=0
 
-FN=' normalizeRubyVersion'
-for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=" $X" ; done
+FN=',normalizeRubyVersion'
+for X in ${ typeset +f ; } ; do [[ $X =~ ^post ]] && FN+=",$X" ; done
 
-ZSCRIPT='#!/bin/ksh93\n. /local/home/admin/etc/log.kshlib\n\nOHOME=~ontohub\n' 
-ZSCRIPT+='integer INIT=0 JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\n'
-ZSCRIPT+="${ typeset -p PSQLDIR REDISDIR GITDIR SITEDIR LNX_CODENAME SOLR_VERS \
-	ZNAME ZDOMAIN ZIP ZNMASK SOLR_VERS ES_VERS RUBY_VERS RBENV_ROOT \
-	GITDATA BRANCH HAS_SOLR WEBAPP_PORT ; }\n"
-ZSCRIPT+='RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInit\n'
-ZSCRIPT+="${ typeset -f -p ${FN} ; }\n\n"
-ZSCRIPT+='#typeset -ft ${ typeset +f ; }\n\n'
-X="${FN// /|}"
-ZSCRIPT+='[[ -z $1 ]] && Log.fatal "Usage: $0 {postInstall'"${X//|postInstall}"'}" && exit 1\n$1'
-print "${ZSCRIPT}" >${ZROOT}/local/home/admin/etc/post-install2.sh
-
+createPostInstall -e PSQLDIR,REDISDIR,GITDIR,SITEDIR,HAS_SOLR,SOLR_VERS,ES_VERS\
+	-e RUBY_VERS,RBENV_ROOT,GITDATA,BRANCH,WEBAPP_PORT -f ${FN}
+sed -i -e '/@VARS_END@/ a\
+\nOHOME=~ontohub\
+integer INIT=0 JOBS=${ grep ^processor /proc/cpuinfo | wc -l ; }\
+RB_ETC="${RBENV_ROOT}/versions/${RUBY_VERS}/etc"\t#see postInit\
+'	${ZROOT}/${POST_ISCRIPT}
 
 # fire the postinstall stuff inside
-zlogin ${ZNAME} /bin/ksh93 /local/home/admin/etc/post-install2.sh postInstall
+zlogin ${ZNAME} ${POST_ISCRIPT} postInstall2
 
 rebootZone
 # vim: ts=4 sw=4 filetype=sh
