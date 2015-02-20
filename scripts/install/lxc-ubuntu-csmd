@@ -43,7 +43,7 @@ unset SOPT DEFAULT MIRROR SECURITY_MIRROR ; typeset -A SOPT DEFAULT
 # never show up in any log and log messages from the GZ ends up in a zone's
 # log, but one can't control into which one it goes (appears to be randomly
 # distrubuted over all zones).
-A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils acl iptables ulogd2 ca-certificates -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
+A=( ${packages_template:-'ssh vim ksh gawk xz-utils libcap-ng-utils acl iptables ulogd2 ca-certificates autofs nfs-common lsof strace patch ed -mawk -debconf-i18n -dmsetup -e2fsprogs -e2fslibs -isc-dhcp-client -isc-dhcp-common -ntpdate -sudo'} )
 X="${A[*]}"
 unset A
 

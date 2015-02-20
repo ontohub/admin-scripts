@@ -13,6 +13,7 @@ DEFAULT_BRANCH='staging.ontohub.org'
 WEBAPP_PORT=3000
 # The directory, which contains bin/hets-server and lib/hets-server etc.
 HETS_DESTDIR=/usr
+export PGHOST='/var/run/postgresql'
 
 typeset -A CFG
 export LC_CTYPE=C LC_MESSAGES=C LC_COLLATE=C LC_TIME=C GIT=${ whence git ; }
@@ -20,7 +21,7 @@ integer HAS_SOLR=0
 
 CFG[url]='https://github.com/ontohub/ontohub.git'
 CFG[repo]=${HOME%%/}/ontohub CFG[dest]=${HOME%%/}
-CFG[datadir]=/data/git
+CFG[datadir]='/data/git'
 
 LIC='[-?$Id$ ]
 [-copyright?Copyright (c) 2014 Jens Elkner. All rights reserved.]
@@ -119,25 +120,62 @@ function updateRepo {
 		Log.warn "Changing incorrect .ruby-version '$X' to '$Y'!" && \
 		print "$Y" >.ruby-version
 
-	if (( ! PULL )); then
+	if [[ ! -e config/settings.local.yml ]]; then
 		Log.info 'Applying 1st time aka only once modifications ...'
+
 		# base config for the first time, only.
-		typeset A B X HNAME
+		typeset A B HNAME SET
 		integer I
 		A=( ${ getent hosts ${ hostname ; } ; } )
 		for (( I=1 ; I < ${#A[@]}; I++ )); do
 			B=( ${A[I]//./ } )
 			(( ${#B[@]} > 1 )) && HNAME="${A[I]}" && break
 		done
-		sed -e "/^source / a\gem 'puma'" -i Gemfile && rm Gemfile.lock
+		I=0
+		SET=''
+		for X in ~(N)${HOME}/etc/*.patch ; do
+			#patch -p1 -i $X
+			git apply $X
+			git status -s | while read A B Y ; do
+				[[ $A == '??' && -f $B ]] && SET+="$B "
+			done
+			[[ -n ${SET} ]] && git add ${SET}
+			A=${ git commit -a -m "${X##*/}" 2>&1 ; }
+			(( $? )) && print "$A" || print "Patch ${X##*/} applied"
+		done
+		if [[ -e public/.htaccess ]]; then
+			# missing 1170-frontend-notes.patch
+			rm -f public/.htaccess
+		fi
+		# oh my goodness, this stuff is whitespace sensitive!
+		sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
+			-i app/assets/stylesheets/navbar.css.sass
+
+		# missing 1170-puma-support.patch ?
+		grep -q puma Gemfile || sed -e "/^source / a\gem 'puma'" -i Gemfile
+		[[ Gemfile -nt Gemfile.lock ]] && rm Gemfile.lock
+
+		# actually we could use config/settings/{production,...}.local.yml
+		# but we do not wanna have even more files to maintain - keep it flat
+		[[ ${CFG[renv]} == 'production' ]] && \
+			SET='log_level: warn\nconsider_all_requests_local: false' || \
+			SET='#log_level: debug\nconsider_all_requests_local: true'
+
+		SET+="\nfooter:"
+		SET+="\n  - text: ${MY_ORG}"
+		SET+="\n  - text: About"
+		SET+="\n    href: http://wiki.ontohub.org/"
+		SET+="\n  - text: Sources"
+		SET+="\n    href: https://github.com/ontohub/ontohub"
+		SET+="\n\nname: ${MY_NAME}"
 		if [[ -n ${HNAME} ]]; then
 			case "${CFG[branch]}" in
-				master)					MY_NAME+=' dead' ;;
+				master)					SET+=' dead' ;;
 				ontohub.org)			;;
-				staging)				MY_NAME+=' dead β' ;;
-				staging.ontohub.org)	MY_NAME+=' β' ;;
-				development)			MY_NAME+=' dead α' ;;
-				*)						MY_NAME+=' α' ;;
+				staging)				SET+=' dead β' ;;
+				staging.ontohub.org)	SET+=' β' ;;
+				development)			SET+=' dead α' ;;
+				*)						SET+=' α' ;;
 			esac
 			X='@'
 			# hook for inofficial zones
@@ -146,22 +184,15 @@ function updateRepo {
 				HNAME="${HNAME%%.*}.iws.cs.ovgu.de" && X="+oh-${HNAME%%.*}@"
 
 			Y=${HNAME#*.}
-			[[ -n ${MAIL_GW} ]] && OUT='smtp' || OUT='sendmail' 
-			# what a crap:  each branch comes with different defaults
-			sed -e "/^hostname:/ s,:.*,: ${HNAME}," \
-				-e "/^email:/ s,:.*,: noreply@${HNAME}," \
-				-e "/fallback_commit_user:/ s,:.*,: 'webservd',"\
-				-e "/fallback_commit_email:/ s,:.*,: 'ontohub${X}${Y}',"\
-				-e "/\/\/about/ s,about.*,${HNAME}/about/," \
-				-e "/sender_address:/ s,:.*,: webservd@${HNAME}," \
-				-e "/email_prefix:/ s,ontohub.*exception,ontohub ex," \
-				-e "s,exception-recipient@.*,ex${X}${Y}," \
-				-e "/^name:/ s,:.*,: '${MY_NAME}'," \
-				-e "/text: Foo Institute/ s,:.*,: ${MY_ORG}," \
-				-e "/^[[:space:]]*delivery_method:/ s,:.*,: ${OUT}," \
-				-i config/settings.yml
-			# delivery_method setting in config/settings.yml seems to be useless
-			X='\
+			SET+="\nhostname: ${HNAME}"
+			SET+="\nexception_notifier:"
+			SET+="\n  sender_address: webservd@${HNAME}"
+			SET+="\n  email_prefix: '[ontohub ex]'"
+			SET+="\n  exception_recipients:\n  - ex${X}${Y}"
+
+			if ! grep -q config.fqdn config/application.rb ; then
+				# mail setting in config/settings.yml seems to be useless
+				X='\
 	config.action_mailer.default_url_options = { :host => '"'${HNAME}'"' }\
 	config.action_mailer.delivery_method = :smtp\
 	config.action_mailer.smtp_settings = {\
@@ -170,31 +201,37 @@ function updateRepo {
 		:enable_starttls_auto	=> false,\
 		:domain					=> '"'${HNAME}'"'\
 	}'
-			sed -e "/= APP_CONFIG =/ a\  ${X}" \
-				-e '/# ActionMailer/,/end/ { N;d }' -i config/application.rb
-			# Grrr. All the config stuff is a real big crazy mess.
-			sed -e '/config.action_mailer.default_url_options/ s,c,#c,' \
-				-i config/environments/development.rb
-			sed -e '/^hostname:/ s,^,#,' -i config/settings/development.yml
+				sed -e "/= APP_CONFIG =/ a\  ${X}" \
+					-e '/# ActionMailer/,/end/ { N;d }' -i config/application.rb
+				# Grrr. All the config stuff is a real big crazy mess.
+				sed -e '/config.action_mailer.default_url_options/ s,c,#c,' \
+					-i config/environments/development.rb
+			fi
 		fi
 
-		# for cookie encryption
-		F=~ontohub/ontohub/config/initializers/secret_token.rb
+		# cookie encryption: overwrite config/initializers/secret_token.rb
+		#X=${ ~ontohub/bin/rake secret ; }  # no way - cyclic ruby dependency
 		X=' bootstrap.log: lastlog: auth.log: dmesg'
-		#X=${ ~ontohub/bin/rake secret ; }  # avoid cyclic ruby dependency
 		X=${ openssl rand -hex -rand ${X// /\/var/\/log\/} 64 ; }
-		[[ -n $X ]] && print "Ontohub::Application.config.secret_token = '$X'" \
-			>$F
+		[[ -n $X ]] && SET+="\n\nsecret_token: $X"
+	
 
-		# we have the redirect rules included within the vhosts's httpd config
-		rm -f public/.htaccess
-
-		# oh my goodness, this stuff is whitespace sensitive!
-		sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
-			-i app/assets/stylesheets/navbar.css.sass
-
+		if ! grep -q postgresql.conf config/database.yml; then
+			# missing common-settings-behavior.patch
+			sed -i -e \
+			'/\&config/ a\  # the directory containing the postgres DB socket\
+  # see /etc/postgresql/${version}/main/postgresql.conf:unix_socket_directories\
+  host: /var/run/postgresql' config/database.yml
+			sed -i -e 's,username:.*,username: ontohub,' config/database.yml
+		fi
 		# correct/skip unused pathes
-		sed -e '/^version_minimum_version:/ h
+		SET+='\n
+hets_path: !str /usr/bin/hets-server
+hets_lib: !str /usr/lib/hets-server/hets-lib
+hets_owl_tools: !str /usr/lib/hets-server/hets-owl-tools'
+		if ! grep -q 'environment_light' lib/tasks/hets.rake ; then
+			# missing 1170-hets-binary-path.patch
+			sed -e '/^version_minimum_version:/ h
 /^hets_path:/,/^version_minimum_version:/ d
 /^version_minimum_revision:/ { H; x; i\hets_path:\
   - '"${HETS_DESTDIR}"'/bin/hets-server\
@@ -204,59 +241,63 @@ hets_owl_tools:\
   - '"${HETS_DESTDIR}"'/lib/hets-server/hets-owl-tools\
 
 }'			-i config/hets.yml
-		[[ -e lib/tasks/hets.rake ]] && \
 			sed -e '/HETS_CMD =/ s,hets ,hets-server ,' -i lib/tasks/hets.rake
-		sed -i -e '/system/ s,hets ,hets-server ,' -e '/strip/ s,hets`,hets-server`,' \
+			sed -i -e '/system/ s,hets ,hets-server ,' -e '/strip/ s,hets`,hets-server`,' \
 			lib/tasks/test.rake
-		sed -i -e '/exec/ s,hets ,hets-server ,' config/god/hets_workers.rb
+			sed -i -e '/exec/ s,hets ,hets-server ,' config/god/hets_workers.rb
+		fi
 
 		# See ~admin/etc/post-install2.sh (postGit()) - "COW"
-		sed -e "/#{config.git_user}/ s,=.*,= '${CFG[datadir]}'," \
-			-i config/initializers/paths.rb
-		sed -e "/AuthorizedKeysManager/ a\    system('${CFG[datadir]}/.ssh/cp_keys')" \
-			-i app/models/key.rb
+		if ! grep -q 'cp_keys' app/models/key.rb ; then
+			# missing 1170-git-data_dir.patch
+			sed -e "/#{config.git_user}/ s,=.*,= '${CFG[datadir]}'," \
+				-i config/initializers/paths.rb
+			sed -e "/AuthorizedKeysManager/ a\    system('${CFG[datadir]}/.ssh/cp_keys')" -i app/models/key.rb
+		fi
+
+		print "${SET}" >config/settings.local.yml
+	fi
+	# For more or less modern, i.e. thread aware impl.s like JRuby or
+	# Rubinius one would probably start with 1 or #CPUs workers,
+	# #STRANDs/#CPUs as #MaxThreads and #MaxThread/4 as #MinThreads per
+	# worker. Unfortunately we currently use MRI (which uses python like
+	# model, i.e. thread == process), and thus threads are useless
+	# => we need heavyweight workers to distribute the load/to be able
+	# to take advantage of the available strands. Note that wrt. current
+	# staging version (2014-12) one worker uses ~275 MiB RAM (RSS)!
+	#
+	# Also note, that - if one uses apache httpd in mpm-worker mode (what
+	# we and usually all smart people do) infront of puma, the number of the
+	# httpd setting 'ThreadsPerChild' is directly related to puma's
+	# #Workers (or for thread aware impl.s to #Worker*#MaxThreads). I.e.
+	# in the apache conf there is exactly one 'ProxyPass*' directive, which
+	# causes a request to be passed to puma. Since each 'ProxyPass*' gets
+	# managed by a single worker, this in turn means, that exactly ONE
+	# apache worker aka process will be used to proxy all related requests.
+	#
+	# And since apache httpd uses for each connection a single thread, it
+	# should be clear, that if 'ThreadsPerChild=24' is set (which is the
+	# default - see http://localhost/server-info?event.c), it is - at least
+	# in our heavy weight scenario - a waste of resources, if we instruct
+	# puma to use more than 24 workers.
+	integer STRANDS=${ nproc ; } THREADS=1 MINTHREADS=1 CPUS
+	if (( 0 )); then
+		CPUS=${ grep 'physical id' /proc/cpuinfo|sort -u|wc -l ; }
+		integer CORES=${ grep 'core id' /proc/cpuinfo|sort -u|wc -l ; }
+		(( THREADS=STRANDS/CPUS ))
+		(( THREADS < 2 )) && THREADS=4
+		(( CPUS < 1 )) && CPUS=1
+		(( MINTHREADS=THREADS/4 ))
+	else
+		(( CPUS=STRANDS*0.75 ))
 	fi
 	if [[ ! -e config/puma.rb ]]; then
+		# missing 1170-puma-support.patch
 		Log.info 'Creating config/puma.rb ...'
-		# For more or less modern, i.e. thread aware impl.s like JRuby or
-		# Rubinius one would probably start with 1 or #CPUs workers,
-		# #STRANDs/#CPUs as #MaxThreads and #MaxThread/4 as #MinThreads per
-		# worker. Unfortunately we currently use MRI (which uses python like
-		# model, i.e. thread == process), and thus threads are useless
-		# => we need heavyweight workers to distribute the load/to be able
-		# to take advantage of the available strands. Note that wrt. current
-		# staging version (2014-12) one worker uses ~275 MiB RAM (RSS)!
-		#
-		# Also note, that - if one uses apache httpd in mpm-worker mode (what
-		# we and usually all smart people do) infront of puma, the number of the
-		# httpd setting 'ThreadsPerChild' is directly related to puma's
-		# #Workers (or for thread aware impl.s to #Worker*#MaxThreads). I.e.
-		# in the apache conf there is exactly one 'ProxyPass*' directive, which
-		# causes a request to be passed to puma. Since each 'ProxyPass*' gets
-		# managed by a single worker, this in turn means, that exactly ONE
-		# apache worker aka process will be used to proxy all related requests.
-		#
-		# And since apache httpd uses for each connection a single thread, it
-		# should be clear, that if 'ThreadsPerChild=24' is set (which is the
-		# default - see http://localhost/server-info?event.c), it is - at least
-		# in our heavy weight scenario - a waste of resources, if we instruct
-		# puma to use more than 24 workers.
-		integer STRANDS=${ nproc ; } THREADS=1 MINTHREADS=1 CPUS
-		if (( 0 )); then
-			CPUS=${ grep 'physical id' /proc/cpuinfo|sort -u|wc -l ; }
-			integer CORES=${ grep 'core id' /proc/cpuinfo|sort -u|wc -l ; }
-			(( THREADS=STRANDS/CPUS ))
-			(( THREADS < 2 )) && THREADS=4
-			(( CPUS < 1 )) && CPUS=1
-			(( MINTHREADS=THREADS/4 ))
-		else
-			(( CPUS=STRANDS*0.75 ))
-		fi
-		X='# see http://www.rubydoc.info/gems/puma/2.10.2/file/README.md\n'
-		X+="environment '${CFG[renv]}'\n"
+		X='# see http://www.rubydoc.info/gems/puma/\n'
+		X+="environment 'production'\nquiet\n"	# no need to "debug" puma
 		X+="threads ${MINTHREADS},${THREADS}\nworkers ${CPUS}\n"
 		X+="bind 'tcp://0.0.0.0:${WEBAPP_PORT}'\n"
-		[[ ${CFG[renv]} == 'production' ]] && X+='quiet\n'
 		X+='preload_app!
 
 # as suggested by the doc
@@ -274,27 +315,33 @@ on_worker_boot do
 end
 '
 		print "$X" >config/puma.rb
+	elif (( ! PULL )); then
+		# defaults are ok - just adjust the workers
+		sed -i -e "/^workers/ s,^.*,workers ${CPUS}," config/puma.rb
 	fi
 
-	# "no git.datadir setting" workaround
-	if [[ -n ${CFG[datadir]} && -d ${CFG[datadir]} ]]; then
-		if [[ -d data && ! -h data ]]; then
-			integer K
-			for (( K=999; K > -1; K-- )); do
-				[[ -d data.$K ]] || break
-			done
-			if (( K < 0 )); then
-				Log.info "Skipping symlinking data to '${CFG[datadir]}'." \
-					'Too many old backup dirs. rm data.* to cleanup.'
-				return 10
+	if ! grep -q data_dir config/settings.yml ; then
+		# missing 1170-git-data_dir.patch
+		if [[ -n ${CFG[datadir]} && -d ${CFG[datadir]} ]]; then
+			if [[ -d data && ! -h data ]]; then
+				integer K
+				for (( K=999; K > -1; K-- )); do
+					[[ -d data.$K ]] || break
+				done
+				if (( K < 0 )); then
+					Log.info "Skipping symlinking data to '${CFG[datadir]}'." \
+						'Too many old backup dirs. rm data.* to cleanup.'
+					return 10
+				fi
+				mv data data.$K || return 11
+			else
+				rm -f data || return 12	
 			fi
-			mv data data.$K || return 11
-		else
-			rm -f data || return 12	
+			ln -s ${CFG[datadir]} data || return 13
+		elif [[ ! -e data ]]; then	# do not change, if it already exists
+			mkdir data || return 13
 		fi
-		ln -s ${CFG[datadir]} data || return 13
-	elif [[ ! -e data ]]; then	# do not change, if it already exists
-		mkdir data || return 13
+		chmod g+w data
 	fi
 
 	# the running webapp wanna write its {production|development|sidekiq}.log
@@ -304,7 +351,7 @@ end
 	touch log/${X}.log
 	# god.log comes from the god-serv service (is relocatable)
 	[[ ! -e ~/log ]] && mkdir ~/log
-	chmod g+w data log log/${X}.log ~/log
+	chmod g+w log log/${X}.log ~/log
 
 	# don't call dangerous scripts, which may destroy data unintentionally, or
 	# invoke sudo behind the scene, or seem to be simply overhead
@@ -315,9 +362,12 @@ end
 
 function buildGems {
 	typeset X Y A RUBY=${ whence ruby ; }
+	integer COMMIT=0 I
 
 	[[ -z ${RUBY} ]] && Log.fatal "No 'ruby' installed?" && return 1
 	cd "${CFG[repo]}" || return 4
+	# actually there is no need to comit if Gemfile is properly constructed...
+	[[ -e Gemfile.lock ]] || COMMIT=1
 
 	A=( ${ ${RUBY} -e 'puts RUBY_VERSION' 2>/dev/null ; } )
 	Y=${ getRepoRubyVersion ; }
@@ -356,16 +406,13 @@ function buildGems {
 		fi
 	fi
 
-	# Preconfigure - who knows, why ...
-	# git stash ; git stash apply
-	sed -e "/group: / s,:.*,: 'webservd'," -i config/settings/production.yml
-	sed -e 's,username:.*,username: ontohub,' -i config/database.yml
-
 	Log.info 'Trying to build ontohub gems ...'
 	# discard any settings from previous runs (especially BUNDLE_WITHOUT:)
 	rm -f .bundle/config
 
 	# 1693M
+	grep -q config.log_level config/application.rb && I=0 || I=1
+	# missing 1170-log_level-misc-settings.patch
 	if [[ ${RAILS_ENV} == 'production' ]]; then
 		A=(
 			'--without' 'development' 'test' #'deployment'
@@ -375,7 +422,7 @@ function buildGems {
 		# and avoid the madness what gets called "Logging" in rails (actually
 		# the complete actionpack/lib/action_controller/log_subscriber.rb is
 		# total crap)
-		sed -e '/config.consider_all_requests_local/ s,true,false,' \
+		(( I )) && sed -e '/config.consider_all_requests_local/ s,true,false,' \
 			-e '/config.log_level/ s,^.*,	config.log_level = :warn,' \
 			-i config/environments/production.rb
 		# what the heck ...
@@ -384,7 +431,7 @@ function buildGems {
 		unset A
 		# show error details on web pages
 		# and use default "Logging"
-		sed -e '/config.consider_all_requests_local/ s,false,true,' \
+		(( I )) && sed -e '/config.consider_all_requests_local/ s,false,true,' \
 			-e '/config.log_level/ s,^.*,	# config.log_level = :debug,' \
 			-i config/environments/production.rb
 		sed -e '/system / s, -L, -v -L,' -i lib/tasks/sidekiq.rake
@@ -399,6 +446,7 @@ function buildGems {
 	
 	# update the Gemfile.lock file and actually build the gems
 	bundler install --path="${CFG[dest]}" "${A[@]}" || return $?
+	(( COMMIT )) && git commit -m 'Gemfile.lock bundler update' Gemfile.lock
 
 	# for convinience put the tools into a std path
 	[[ -d ~/bin ]] || mkdir ~/bin

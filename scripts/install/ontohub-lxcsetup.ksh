@@ -92,7 +92,7 @@ createTempdir
 addPkg install	sudo					# Till wills haben
 addPkg install	apache2 apache2-utils	# web frontend
 addPkg install	postgresql				# DB
-addPkg install	git						# ontology repo management
+addPkg install	git subversion git-svn	# ontology repo management
 addPkg install	fonts-liberation		# includes best non-prop. font ever seen
 # hours of work: ruby does not say, that it needs readline, but actually
 # compiling without it will give a lot of headaches ('gem install rb-readline'
@@ -334,7 +334,7 @@ function postOntohub {
 	SCRIPT='etc/god-serv.sh'
 	Log.info "$0 setup ..."
 	print 'description "Ontohub process manager aka god"
-start on (net-device-up and local-filesystems)
+start on (static-network-up and local-filesystems)
 stop on runlevel [016]
 
 # gracefull shutdowns may take more than 5s
@@ -375,6 +375,7 @@ cd ${REPO} || exit 1
 [[ -d ${HOME}/log ]] || mkdir ${HOME}/log
 [[ -e log ]] || ln -s ${HOME}/log log
 
+[[ -z ${RAILS_ENV} ]] && RAILS_ENV='production'
 export RAILS_ENV HOME
 #X=${ whence hets ; }
 #if [[ -z $X ]]; then
@@ -417,7 +418,7 @@ fi
 
 	SCRIPT='etc/puma-serv.sh'
 	print 'description "Ontohub WebApplication Server (puma)"
-start on (net-device-up and local-filesystems)
+start on (static-network-up and local-filesystems)
 stop on runlevel [016]
 
 # gracefull shutdowns may take more than 5s
@@ -456,6 +457,7 @@ RB_PROFILE=/local/usr/ruby/.profile
 
 cd ${REPO} || exit 1
 
+[[ -z ${RAILS_ENV} ]] && RAILS_ENV='production'
 export RAILS_ENV RACK_ENV=${RAILS_ENV} HOME
 
 case "$1" in
@@ -521,10 +523,14 @@ function postDb {
 
 	service postgresql stop
 
-	typeset X=${ pg_config --bindir ; } Y Z DB SQL
-
-	[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && DB='ontohub' \
-		|| DB='ontohub_development,ontohub_test'
+	# since config/database.yml lists all 3 DBs (for the production, test and
+	# development env.) we need to create all 3, because the "rails setup"
+	# mechanism aka 'bundler install' tries to mangle all of them. Would not
+	# hurt to skip *_{development,test} on production systes, but than errors
+	# and stack traces gets spit out and it is hard for a casual user to
+	# determine, whether they can be ignored ... -> let's waste some ressources
+	typeset X=${ pg_config --bindir ; } Y Z SQL \
+		DB='ontohub,ontohub_development,ontohub_test'
 
 	[[ ! -d ${PSQLDIR}/main ]] && mkdir ${PSQLDIR}/main && \
 		chown postgres:postgres ${PSQLDIR}/main
@@ -1125,7 +1131,7 @@ EOF
 		typeset APPBASE="${OHOME}/ontohub/public" RENV='development' ASSETS=''
 		[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && \
 			RENV='production' && ASSETS='|assets'
-		[[ ${OHOME}/ontohub/public/static ]] && ASSETS+='|static'
+		ASSETS+='|static'
 	
 		# so map the app completely to /
 		sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \

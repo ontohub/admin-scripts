@@ -34,6 +34,10 @@ function fixNetbackup {
 		if [[ ${ file netbackup-client-svcs.deb ; } =~ Debian\ binary ]]; then
 			cp -p netbackup-client-svcs.deb ${ZROOT}/var/tmp/
 			zlogin ${ZNAME} dpkg -i /var/tmp/netbackup-client-svcs.deb
+			mkdir ${ZROOT}/var/netbackup/logs/bpbkar
+			# do in setup after customizRunningZone
+			rm -f  ${ZROOT}/etc/init/netbackup-{vxpbx,vnetd}.override
+			sed -i -e '/^#BACKUP_SERVER=/ s,^#,,' ${ZROOT}/etc/init.d/iptables
 		fi
 	fi
 	[[ -e ${ZROOT}/etc/netbackup/bp.conf ]] && \
@@ -60,6 +64,26 @@ SERVER = clarke.urz.uni-magdeburg.de
 		[[ -d /etc/netbackup ]] && mkdir /etc/netbackup
 		cp "${EXCLUDES}" ${ZROOT}/etc/netbackup/exclude_list
 	fi
+}
+
+function enableNFS {
+	if [[ -e ${ZROOT}/etc/idmapd.conf ]]; then
+		sed -r -e '/^(# *)?Domain/ s,^.*,Domain = cs.ovgu.de,' \
+			-i ${ZROOT}/etc/idmapd.conf
+		chmod a+r ${ZROOT}/etc/idmapd.conf	# paranoid debian folks
+	fi
+	print '# /etc/nfsmount.conf
+[ NFSMount_Global_Options ]
+proto=tcp
+rsize=1048576
+wsize=1048576
+'		>${ZROOT}/etc/nfsmount.conf
+	[[ -e ${ZROOT}/etc/init.d/iptables ]] || return
+
+	[[ -z ${NFS_SERVER} ]] && NFS_SERVER="${ getIP pkg; } ${ getIP software; }"
+	[[ -z ${NFS_SERVER} ]] && return
+	sed -i -e "/^#NFS_SERVER=/ s,^.*,NFS_SERVER=( ${NFS_SERVER} )," \
+		${ZROOT}/etc/init.d/iptables
 }
 
 Man.addFunc customizeRunningZone '' '[+NAME?customizeRunningZone - "standard" customization of a running zone]
