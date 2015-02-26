@@ -2,7 +2,7 @@
 # Common Development and Distribution License (the "License")
 # (see http://www.opensource.org/licenses/CDDL-1.0).
 #
-# Copyright (c) 2011 Jens Elkner. All rights reserved.
+# Copyright (c) 2011, 2012 Jens Elkner. All rights reserved.
 # Use is subject to license terms.
 
 # requires . ${LIBNAME%/*}/man.kshlib
@@ -30,8 +30,8 @@ function listVars {
 	else
 		L="${LASTENV}"
 	fi
-	CHANGED=""
-	LAST=""
+	CHANGED=''
+	LAST=''
 	print "$L\n$K\n" | sort | uniq -u | while read LINE ; do
 		VAR=${LINE%%=*}
 		VAR=${VAR##* }
@@ -47,6 +47,23 @@ function listVars {
 	print "$K\n" | egrep "(^| )(${CHANGED:1})="
 	print '==================================================================='
 	LASTENV="$K"
+}
+
+Man.addFunc getprop '' '[+NAME?getprop - convenience function to retrieve a SMF property from the current zone (Solaris 11+).]
+[+DESCRIPTION?Convinience function for "svcprop -p PROPERTY SMF_FMRI", but returns instead an empty string if the property does not exist or its value is "".]
+\n\n\aproperty\a \aSMF_FMRI\a\n\n
+[+ENVIRONMENT VARIABLES?]{
+[+PROPVAL?Gets set to the value returned by this function.]
+}'
+function getprop {
+    [[ -z $1 || -z $2 ]] && 
+		Log.warn "getprop(): invalid arguments" && return
+    svcprop -q -p $1 $2
+    if (( $? == 0 )) ; then
+        PROPVAL=${ svcprop -p $1 $2; }
+        [[ $PROPVAL == '""' ]] && return
+    fi
+    print -- "$PROPVAL"
 }
 
 Man.addFunc getNetmaskBits '' '[+NAME?getNetmaskBits - get the number of significant netmask bits from a netmask.]
@@ -123,11 +140,7 @@ Man.addVar MAC 'Default Mac address to use for primary VNIC of the zone. Only se
 Man.addVar MAC_PREFIX 'The first 3 bytes (zero padded!) to use, when a new MAC address needs to be generated. Default: "00:01:01" - PRIVATE according to http://standards.ieee.org/regauth/oui/oui.txt . See \bgetDefaultIfAndMac()\b.'
 [[ -z ${MAC_PREFIX} ]] && typeset MAC_PREFIX='00:01:01'
 
-Man.addFunc getDefaultIfAndMac '' '[+NAME?getDefaultIfAndMac - determine the default network interface and MAC address.]
-[+DESCRIPTION?Tries to find out the default network interface to use for new VNICs, which is the one containing the default IP route for this zone. On success \bDEFAULTIF\b gets set to this value and the default MAC address to use (\bMAC\b) gets set. Otherwise \bMAC\b stays unset and \bDEFAULTIF\b gets set to the interface {\auname -n\a}0 (which might be wrong).]
-[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DEFAULTIF MAC_PREFIX MAC; }" '}
-[+SEE ALSO?\broute\b(1M), \bipadm\b(1M), \bdladm\b(1M), \bhostname\b(1)]'
-function getDefaultIfAndMac {
+function getLxcDefaultIfAndMac {
 	typeset X IP A KEY VAL TAIL F
 	typeset -A ZMACS
 	MAC=''
@@ -193,6 +206,33 @@ function getDefaultIfAndMac {
 	done
 }
 
+Man.addFunc getDefaultIfAndMac '' '[+NAME?getDefaultIfAndMac - determine the default network interface and MAC address.]
+[+DESCRIPTION?Tries to find out the default network interface to use for new VNICs, which is the one containing the default IP route for this zone. On success \bDEFAULTIF\b gets set to this value and the default MAC address to use (\bMAC\b) gets set. Otherwise \bMAC\b stays unset and \bDEFAULTIF\b gets set to the interface {\auname -n\a}0 (which might be wrong).]
+[+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DEFAULTIF MAC_PREFIX MAC; }" '}
+[+SEE ALSO?\broute\b(1M), \bipadm\b(1M), \bdladm\b(1M), \bhostname\b(1)]'
+function getDefaultIfAndMac {
+	[[ ${OSNAME} != 'SunOS' ]] && { getLxcDefaultIfAndMac ; return $? ; }
+
+	typeset X IP
+	MAC=""
+	DEFAULTIF=$(route get default | awk '/interface:/ { print $2 }')
+	if [[ -n $DEFAULTIF ]]; then
+		IP=${ ipadm show-addr -p -o addr $DEFAULTIF/ 2>/dev/null; }
+		IP=${IP%/*}
+		if [[ -n $IP ]]; then
+			typeset -a -i B=( ${IP//./ } )
+			typeset -i B4=${ zoneadm list -ip |wc -l; }
+			B4=$((B4<<4))
+			# 11.1 accepts zero padded mac addresses, only
+			MAC=${ printf "%s:%02x:%02x:%02x" $MAC_PREFIX ${B[2]} ${B[3]} $B4; }
+		fi
+	else
+		DEFAULTIF=${ hostname; }0
+	fi
+	X=${ dladm show-link -p -o over $DEFAULTIF ; }
+	[[ -n $X ]] && DEFAULTIF=$X
+}
+
 Man.addFunc normalizeMac '' '[+NAME?normalizeMac - normalize a MAC address]
 [+DESCRIPTION?Normalizes the given \amacaddress\a (i.e. backslashes removed, zero padded, lower case) and prints it to stdout.]
 \n\n\amacaddress\a
@@ -221,4 +261,4 @@ function getIP {
 	[[ -n $X ]] && print ${X%%+(\s)*}
 }
 
-# vim: ts=4 filetype=sh
+# vim:ts=4 filetype=sh

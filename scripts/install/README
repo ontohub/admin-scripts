@@ -10,3 +10,11 @@ ontohub instances:
    when calling lxc-create (-t ubuntu-csmd), otherwise one has to supply the
    full path to the template
  - everything else: see $script -h
+```
+ ./base/
+        *-lxcsetup.ksh     LXC zone setup script
+        *-zonesetup.ksh    Solaris 11+ zone setup script
+        etc/*.kshlib       shell libraries used by zone setup and other scripts
+        files/*            misc files to copy over to a zone (e.g. hashCerts)
+        files/ontohub/*    ontohub related files (e.g. oh-update.sh, patches)
+```

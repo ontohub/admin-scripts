@@ -108,4 +108,7 @@ typeset -T ManObj_t=(
 )
 ManObj_t Man
 
+Man.addVar OSNAME 'The name of the OS in the global zone (uname -s).'
+[[ -z ${OSNAME} ]] && OSNAME=${ uname -s ; }
+
 # vim:ts=4 filetype=sh

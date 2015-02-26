@@ -21,6 +21,9 @@ cd $SDIR
 ############################################################################
 # main environment
 ############################################################################
+# avoid stupid ncurses popups
+export DEBIAN_FRONTEND=noninteractive
+
 integer USE_ZFS=0
 # all or nothing
 if [[ -n ${ whence zfs ; } && -n ${ zfs list -H -o name rpool 2>/dev/null ; } ]]
@@ -68,12 +71,18 @@ typeset -r ROOT='rootfs'
 Man.addVar ZROOT 'For convinience (avoid boilerplate code/clutter) ${ZPATH}/${ROOT}.'
 typeset -r ZROOT="${ZPATH}/${ROOT}"
 
-. ${LIBNAME%/*}/datadir.kshlib
+. ${LIBNAME%/*}/lxc-datadir.kshlib
 
 Man.addVar LNX_CODENAME 'The release codename of the linux distribution on the host (see lsb_release -c). (lxc specific)'
 if [[ -z ${LNX_CODENAME} ]]; then
-	LNX_CODENAME=${ lsb_release -c ; }
-	LNX_CODENAME=${LNX_CODENAME##~(E).*[[:space:]]+}
+	X=${ whence lsb_release ; }
+	if [[ -n $X ]]; then
+		LNX_CODENAME=${ lsb_release -c ; }
+		LNX_CODENAME=${LNX_CODENAME##~(E).*[[:space:]]+}
+	else
+		# Assume RedHat
+		LNX_CODENAME='centos'
+	fi
 fi
 
 [[ -z ${URL_SCRIPT} ]] && URL_SCRIPT='http://pkg.iws.cs.ovgu.de/cgi-bin/ubuntu' 
@@ -386,12 +395,17 @@ function checkIP {
 		Log.warn "VNIC $ZVNIC will not get configured because the IP address" \
 			'127.0.0.1 is reserved for the loopback interface lo0.'
 	if [[ -z $ZNMASK ]]; then
-		ZNMASK=$(getent netmasks $ZIP)	
-		if [[ -z $ZNMASK ]]; then
-			BITS=$(getNetmaskBitsByIP $ZIP)
-			[[ -n $BITS ]] && ZNMASK="/$BITS"
+		if [[ ${OSNAME} == 'SunOS' ]]; then
+			ZNMASK=$(getent netmasks $ZIP)	
+			if [[ -z $ZNMASK ]]; then
+				BITS=$(getNetmaskBitsByIP $ZIP)
+				[[ -n $BITS ]] && ZNMASK="/$BITS"
+			else
+				ZNMASK=${ZNMASK##*[[:space:]]}
+			fi
 		else
-			ZNMASK=${ZNMASK##*[[:space:]]}
+			# motherfucking linux has no netmask getent support - assume /24
+			ZNMASK='255.255.255.0'
 		fi
 	fi
 	if [[ -z $ZNMASK ]]; then
@@ -787,12 +801,20 @@ ACTION=""
 X=MAIN
 [[ ${SCRIPT} == ${LIBNAME} ]] && X=LIB
 
+function checkOS {
+	if [[ ${OSNAME} != 'Linux' ]]; then
+		Log.fatal 'This is not Linux. Set OSNAME explicitly to get the stuff' \
+			'from the related OS (dangerous)!'
+		exit 1
+	fi
+}
+
 while getopts "${ print ${Man.FUNC[$X]}; }" option ; do
     case "$option" in
         h) showUsage "${SCRIPT##*/}" $X ; exit 0 ;;
 		L) showUsage "${LIBNAME##*/}" LIB ; exit 0 ;;
-        s) skeleton ; exit 0 ;;
-		S) skeleton -x ; exit 0 ;;
+        s) checkOS && skeleton ; exit 0 ;;
+		S) checkOS && skeleton -x ; exit 0 ;;
 		H)
 			if [[ ${OPTARG%_t} != $OPTARG ]]; then
 				$OPTARG --man						# self-defined types
@@ -811,7 +833,7 @@ while getopts "${ print ${Man.FUNC[$X]}; }" option ; do
 		F) typeset +f ; exit 1 ;;
 		D) showUsage "${LIBNAME##*/}" LIBX; exit 0 ;;
 		i) ACTION="INSTALL" ;;
-		u) destroyZone ; exit $? ;;
+		u) checkOS && destroyZone ; exit $? ;;
 		l) Man.listVars ; exit ;;
 		n) FLUSH=1 ;;
     esac
@@ -830,7 +852,7 @@ fi
 [[ $LIBNAME == $SCRIPT ]] && exit 0
 [[ -z ${ZNAME} ]] && \
 	Log.warn "Unable to determine zone name automagically (ZNAME)!"
-
+checkOS
 trap cleanup EXIT 
 
 # vim: ts=4 sw=4 filetype=sh

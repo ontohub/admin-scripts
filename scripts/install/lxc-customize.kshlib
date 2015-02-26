@@ -54,7 +54,7 @@ SERVER = clarke.urz.uni-magdeburg.de
 
 	# a default exclude_list comes in with "update_config -i". However, there
 	# might be a FQDN|hostname|domain specific one:
-	typeset X EXCLUDES="${SDIR}/files/exclude_list"
+	typeset X EXCLUDES="${SDIR}/files/netbackup/lxc-exclude_list"
 	for X in ${ZHNAME}.${ZDOMAIN} ${ZHNAME} ${ZDOMAIN} ; do
 		[[ -r ${EXCLUDES}@$X ]] && EXCLUDES+="@$X" && X='@' && break
 	done
@@ -96,6 +96,7 @@ function customizeRunningZone {
 
 	fixIptables
 	fixNetbackup
+	enableNFS
 
 	Log.info 'Done.'
 }

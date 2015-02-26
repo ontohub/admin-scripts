@@ -7,14 +7,15 @@
 SDIR=$( cd ${ dirname $0; }; printf "$PWD" )
 MAC_PREFIX=0:80:41
 ZNMASK='/24'
-ZBASE=/tmp
+[[ ${.sh.file##*/} =~ ^td- ]] || ZBASE=/tmp
 
 RBENV_ROOT='/local/usr/ruby'
 RUBY_VERS='2.1.1'	# fallback for ${OHOME}/ontohub/.ruby-version
 ES_VERS='1.4.1'
+RAILS_ENV='production'
 WEBAPP_PORT=3000	# where the webApp [de]muxer is listening for requests
 
-. ${SDIR}/lxc-install.kshlib || exit 1
+. ${SDIR}/etc/lxc-install.kshlib || exit 1
 
 if [[ -z ${BRANCH} ]]; then
 	# hmm, wer keine Arbeit hat, macht sich halt welche ...
@@ -24,8 +25,9 @@ if [[ -z ${BRANCH} ]]; then
 		BRANCH='staging.ontohub.org'		# staging
 	elif [[ ${ZNAME} == 'tc' ]]; then
 		BRANCH='develop.ontohub.org'		# develop
+		RAILS_ENV='development'
 	else
-		BRANCH='develop'
+		BRANCH='staging'
 	fi
 fi
 Log.info "Using branch '${BRANCH}' as zone's default branch ..."
@@ -82,7 +84,6 @@ DATADIR[psql]=(
 # lofs
 DATADIR[netbackup]=( dir=/usr/openv z_dir=/usr/openv mopts="ro" )
 
-
 checkDatadirsPre
 checkIP
 checkNIC
@@ -101,7 +102,7 @@ addPkg install	libreadline6
 addPkg install	curl gcc g++ make cmake	# only rugged needs cmake (+20 M)
 addPkg install	libssl-dev libpq-dev libcurl4-openssl-dev \
 	libxml2-dev libxslt1-dev pkg-config libreadline-dev
-if [[ ${BRANCH} != 'master' && ${BRANCH} != 'staging' ]]; then
+if [[ ${RAILS_ENV} != 'production' ]]; then
 	#addPkg install	apache2-dev libapr1-dev libaprutil1-dev libcurl4-openssl-dev \
 	#libxml2-dev libxslt1-dev pkg-config libreadline-dev
 	# holy cow - capybara-webkit for ontohub testing (+230M => 1436M)
@@ -123,7 +124,7 @@ checkDatadirsPost
 customizeRunningZone
 
 # sometimes one may need to switch over to webservd for testing
-[[ ${BRANCH} != 'master' ]] && \
+[[ ${RAILS_ENV} != 'production' ]] && \
 	sed -re '/^webservd:/ s,:[^:]+$,:/bin/bash,' -i ${ZROOT}/etc/passwd
 
 F="${SDIR}/files/ssh_keys/authorized_keys.bremen"
@@ -143,24 +144,31 @@ fi
 # To avoid a chroot marathon we simply xfer the following functions as script
 # as well as supporting scripts into the zone and run it there.
 URL='https://raw.githubusercontent.com/ontohub/admin-scripts/master/scripts/install/'
-for X in oh-update.sh hashCerts ; do
-	if [[ ! -f ${SDIR}/$X ]]; then
-		curl -O ~admin/etc/$X ${URL}$X
-		read -n 12 X <~admin/etc/$X
-		[[ $X == '#!/bin/ksh93' ]] || rm -f ~admin/etc/$X
+for X in hashCerts ; do
+	F=${SDIR}/files/$X
+	if [[ ! -f $F ]]; then
+		F=~admin/etc/$X
+		wget -O $F ${URL}$X
+		read -n 12 X <$F
+		[[ $X == '#!/bin/ksh93' ]] || rm -f $F
 	fi
-	if [[ ! -f ~admin/etc/$X ]]; then
+	if [[ ! -f $F ]]; then
 		print "echo Fetch $0 from '${URL}/$X' and run it." \
 			>${ZROOT}/local/home/admin/etc/$X
 	else
-		cp ${SDIR}/$X ${ZROOT}/local/home/admin/etc/$X
-		[[ $X == 'oh-update.sh' ]] && \
-			sed -e "/^CFG\[datadir\]=/ s,=.*,='${DATADIR[git].z_dir}'," \
-				-i ${ZROOT}/local/home/admin/etc/$X
+		cp $F ${ZROOT}/local/home/admin/etc/$X
 	fi
 	chmod 0755 ${ZROOT}/local/home/admin/etc/$X
 done
 
+F=${ZROOT}${ZUSER[ontohub].home}/etc
+[[ -d $F ]] || mkdir -p $F
+[[ ${RAILS_ENV} == 'production' ]] && X='' || X='develop/'
+[[ -d ${SDIR}/files/ontohub ]] && \
+	cp -p ${SDIR}/files/ontohub/{oh-update.sh,${X}*.patch} $F/
+chown -R ${ZUSER[ontohub].uid}:${ZUSER[ontohub].gid} $F
+F+='/oh-update.sh'
+[[ -e $F ]] && sed -e "/^CFG\[datadir\]=/ s,=.*,='${DATADIR[git].z_dir}'," -i $F
 
 function postRuby {
 	###########################################################################
@@ -317,18 +325,15 @@ function postElasticsearch {
 
 function postOntohub {
 	postInit || return $?
-	typeset SCRIPT X DB RAILS_ENV LOGLVL=debug
+	typeset SCRIPT X DB='ontohub' RAILS_ENV='production' LOGLVL='warn'
 
 	Log.info "$0 setup ..."
-	if [[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]]; then
-		X='-P'
-		DB='ontohub'
-		RAILS_ENV='production'
-		LOGLVL='warn'	# don't wanna get useless debug msgs @INFO level
-	else
-		X=''
-		DB='ontohub_development'
-		RAILS_ENV='development'
+	if [[ ! ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]]; then
+		DB+='_development'
+		# Most stuff doesn't simply work in non-production mode, even in the
+		# development branch !!!
+		#RAILS_ENV='development'
+		LOGLVL='debug'	# don't wanna get useless debug msgs @INFO level
 	fi
 		
 	SCRIPT='etc/god-serv.sh'
@@ -375,7 +380,6 @@ cd ${REPO} || exit 1
 [[ -d ${HOME}/log ]] || mkdir ${HOME}/log
 [[ -e log ]] || ln -s ${HOME}/log log
 
-[[ -z ${RAILS_ENV} ]] && RAILS_ENV='production'
 export RAILS_ENV HOME
 #X=${ whence hets ; }
 #if [[ -z $X ]]; then
@@ -457,7 +461,6 @@ RB_PROFILE=/local/usr/ruby/.profile
 
 cd ${REPO} || exit 1
 
-[[ -z ${RAILS_ENV} ]] && RAILS_ENV='production'
 export RAILS_ENV RACK_ENV=${RAILS_ENV} HOME
 
 case "$1" in
@@ -499,7 +502,7 @@ esac
 
 	# buid/install gems required by ontohub server app (~420 MB)
 	[[ -n ${BRANCH} ]] && X+=" -b ${BRANCH}"
-	su - ontohub -c "~admin/etc/oh-update.sh $X"
+	su - ontohub -c "${OHOME}/etc/oh-update.sh $X"
 
 	# allow ssh login
 	sed -e '/^AllowUsers/ { s, ontohub,,g ; s,$, ontohub, }' \
@@ -1128,12 +1131,10 @@ EOF
 			-e "s,@DOMAIN@,${ZDOMAIN},g" ${SITECF%/*}/template.conf >${SITECF}
 
 		# ontohub specials
-		typeset APPBASE="${OHOME}/ontohub/public" RENV='development' ASSETS=''
-		[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && \
-			RENV='production' && ASSETS='|assets'
-		ASSETS+='|static'
-	
-		# so map the app completely to /
+		typeset APPBASE="${OHOME}/ontohub/public" ASSETS='|static|assets'
+		[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] || ASSETS=''
+
+		# map the app's public/ completely to /
 		sed -r -e "/^DocumentRoot/ s,^.*,DocumentRoot ${APPBASE}," \
 			-e "/^<Directory .*\/htdocs\"?/ s,^.*,<Directory \"${APPBASE}\">," \
 			-i ${SITECF}
@@ -1145,7 +1146,7 @@ EOF
 <IfModule rewrite_module>
 	# this needs to be outside the repo dir
 	RewriteCond '"${OHOME}"'/maintenance.txt -f
-	RewriteCond %{REQUEST_URI} !^/(cgi-bin|icons|apache|error|server-)/
+	RewriteCond %{REQUEST_URI} !^/(cgi-bin|icons|apache|error|server)/
 	RewriteRule . /error/HTTP_SERVICE_UNAVAILABLE.html.var [R=503,L]
 
 	# no trailing slashes - why? Is it to fix a webapp bug?
@@ -1247,12 +1248,10 @@ function postGit {
 	# So our workaround is to let an suid script/binary copy this data over to
 	# ~git/.ssh/authorized_keys2 when it got modified via app/models/key.rb.
 
-	# If one creates a repo via webApp, the webApp does a cd to $ontohubRepo 
-	# (for us ${OHOME}/ontohub/), than clones the given repo URI to
-	# $ontohubRepo/data/repositories/${num} and creates a symlink to it like:
-	# ln -s $ontohubRepo/data/repositories/${num} data/git_daemon/${name.git}
-	# To separate this data from the $ontohubRepo we symlink ${GITDATA} to
-	# $ontohubRepo/data in the ~admin/etc/oh-update.sh script. 
+	# If one creates a repo via webApp, the webApp does a cd to $data_dir 
+	# (for us /data/git/), than clones the given repo URI to repositories/${num}
+	# and creates a symlink to it like:
+	# ln -s ../repositories/${num} git_daemon/${name.git}
 	# So the webApp needs RW to ${GITDATA}/{git_daemon,repositories,commits}/
 	# (the last one for CLI usage?) too.
 
@@ -1295,7 +1294,7 @@ main(int argc, char *argv[])
 		${SCRIPT}
 	# our zone install ensures, that there is a ~git/.ssh/authorized_keys2 with
 	# the right owner and permissions
-	[[ ! -f ${KEYS} ]] && cp -p ${UKEYS} ${KEYS}
+	[[ -f ${KEYS} ]] || touch ${KEYS}
 	chown webservd:webservd ${KEYS}
 	chmod 0640 ${KEYS}
 	# make new files group writable
@@ -1357,9 +1356,9 @@ function postInstall2 {
 
 	# just clone the ontohub server app repository (~35 MB)
 	[[ -n ${BRANCH} ]] && X="-b ${BRANCH}" || X=''
-	[[ ${BRANCH} == 'master' || ${BRANCH} == 'staging' ]] && X+=' -P'
+	#[[ ${BRANCH} =~ ^(master|staging|ontohub)($|\.) ]] && X+=' -P'
 	# pull/checkout to get the needed ruby version
-	su - ontohub -c "~admin/etc/oh-update.sh $X -u" 
+	su - ontohub -c "${OHOME}/etc/oh-update.sh $X -u" 
 	postInit || return $?	# because this may change pkg selection
 	(( HAS_SOLR )) && PKGS+=' tomcat7 tomcat7-admin' || \
 		PKGS+=' openjdk-7-jre-headless'	# actually redundant (hets deps on it)

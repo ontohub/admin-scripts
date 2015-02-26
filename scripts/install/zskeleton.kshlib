@@ -65,7 +65,7 @@ function skeleton {
 	Man.printFuncComment $COMMENT 'createTempdir'
 	print 'createTempdir\n'
 
-	if [[ ${ uname -s ; } == 'SunOS' ]]; then
+	if [[ ${OSNAME} == 'SunOS' ]]; then
 		Man.printVarComment $COMMENT 'MANIFEST' && print
 		Man.printFuncComment $COMMENT 'prepareManifest'
 		print 'prepareManifest\n'
@@ -86,10 +86,10 @@ function skeleton {
 	Man.printFuncComment $COMMENT 'installZone'
 	print 'installZone || exit $?\n'
 
-	if [[ ${ uname -s ; } == 'SunOS' ]]; then
+	if [[ ${OSNAME} == 'SunOS' ]]; then
 		Man.printFuncComment $COMMENT 'addPrimaryAdministrator'
 		print '#addPrimaryAdministrator\n'
-	elif [[ ${ uname -s ; } == 'Linux' ]]; then
+	elif [[ ${OSNAME} == 'Linux' ]]; then
 		Man.printFuncComment $COMMENT 'customizeZone'
 		print 'customizeZone || exit $?\n'
 	fi

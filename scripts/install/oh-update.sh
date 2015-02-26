@@ -23,15 +23,16 @@ CFG[url]='https://github.com/ontohub/ontohub.git'
 CFG[repo]=${HOME%%/}/ontohub CFG[dest]=${HOME%%/}
 CFG[datadir]='/data/git'
 
-LIC='[-?$Id$ ]
+LIC='[-?$Id: oh-update.sh,v 0a7ae1797527 2015-02-26 17:49:11Z jel+opengrok $ ]
 [-copyright?Copyright (c) 2014 Jens Elkner. All rights reserved.]
 [-license?CDDL 1.0]'
 typeset -r SDIR=${.sh.file%/*} FPROG=${.sh.file} PROG=${FPROG##*/}
 
 for H in log.kshlib man.kshlib ; do
-	X=${SDIR}/$H
+	X=${SDIR}/etc/$H
 	[[ -r $X ]] && . $X && continue
 	X=${ whence $H; }
+	[[ -z $X && -r ~admin/etc/$H ]] && X=~admin/etc/$H
 	[[ -z $X ]] && print "$H not found - exiting." && exit 1
 	source $X 
 done
@@ -69,7 +70,7 @@ function firstTimeChanges {
 	Log.info 'Applying 1st time aka only once modifications ...'
 
 	# base config for the first time, only.
-	typeset A B HNAME SET
+	typeset A B HNAME SET RUBY=${ whence ruby ; }
 	integer I
 	A=( ${ getent hosts ${ hostname ; } ; } )
 	for (( I=1 ; I < ${#A[@]}; I++ )); do
@@ -81,16 +82,23 @@ function firstTimeChanges {
 	for X in ~(N)${HOME}/etc/*.patch ; do
 		#patch -p1 -i $X
 		git apply $X
-		git status -s | while read A B Y ; do
-			[[ $A == '??' && -f $B ]] && SET+="$B "
-		done
-		[[ -n ${SET} ]] && git add ${SET}
-		A=${ git commit -a -m "${X##*/}" 2>&1 ; }
-		(( $? )) && print "$A" || print "Patch ${X##*/} applied"
+		if (( CFG[commit] )); then
+			git status -s | while read A B Y ; do
+				[[ $A == '??' && -f $B ]] && SET+="$B "
+			done
+			[[ -n ${SET} ]] && git add ${SET}
+			A=${ git commit -a -m "${X##*/}" 2>&1 ; }
+			(( $? )) && print "$A" || print "Patch ${X##*/} applied"
+		else
+			print "Patch ${X##*/} applied"
+		fi
 	done
 	# oh my goodness, this stuff is whitespace sensitive!
 	sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
 		-i app/assets/stylesheets/navbar.css.sass
+	# when ~ontohub/ontohub/git/bin/git-shell gets fired, no shell profiles are
+	# read and thus env ruby would not found a ruby not installed in /usr/bin
+	sed -i -e "1 s,^.*,#\!${RUBY}," git/bin/git-shell
 
 	[[ Gemfile -nt Gemfile.lock ]] && rm Gemfile.lock
 
@@ -128,7 +136,11 @@ function firstTimeChanges {
 		SET+="\n  sender_address: webservd@${HNAME}"
 		SET+="\n  email_prefix: '[ontohub ex]'"
 		SET+="\n  exception_recipients:\n  - ex${X}${Y}"
+		# Current debian/ubuntu sendmail package is a horror pain in the ass!!!
+		# Wenn Leute mit Stroh im Kopf mit Feuer spieln, wird's brenzlig ... 
+		# So for now direct delivery:
 	fi
+	SET+='\naction_mailer:\n  delivery_method: smtp'
 
 	# cookie encryption: overwrite config/initializers/secret_token.rb
 	#X=${ ~ontohub/bin/rake secret ; }  # no way - cyclic ruby dependency
@@ -213,8 +225,9 @@ function updateRepo {
 		Log.fatal "'${PWD}' exists but it does not seem to be a git repository."
 		return 3
 	fi
-	[[ ${CFG[prod]} == '1' || ${OUT} =~ ^(master|staging)(\.ontohub\.org)?$ ]] \
-		&& CFG[renv]='production' || CFG[renv]='development'
+	# [[ ! ${OUT} =~ ^(master|staging)(\.ontohub\.org)?$ ]] && \
+	#	CFG[renv]='development
+	[[ -z ${CFG[renv]} ]] && CFG[renv]='production'
 
 	if [[ -n ${CFG[branch]} && ${OUT} != ${CFG[branch]} ]]; then
 		Log.info "Switching branch from '${OUT}' to '${CFG[branch]}' ..."
@@ -330,7 +343,8 @@ function buildGems {
 	
 	# update the Gemfile.lock file and actually build the gems
 	bundler install --path="${CFG[dest]}" "${A[@]}" || return $?
-	(( COMMIT )) && git commit -m 'Gemfile.lock bundler update' Gemfile.lock
+	(( COMMIT && CFG[commit] )) && \
+		git commit -m 'Gemfile.lock bundler update' Gemfile.lock
 
 	# for convinience put the tools into a std path
 	[[ -d ~/bin ]] || mkdir ~/bin
@@ -357,6 +371,8 @@ function resetDb {
 	Log.info 'Resetting database ...'
 
 	export RAILS_ENV=${CFG[renv]}
+	typeset DB='ontohub' DBUSER='ontohub'
+	[[ ${RAILS_ENV} != 'production' ]] && DB+='_development'
 
 	redis-cli flushdb
 	# see http://blog.endpoint.com/2012/10/postgres-system-triggers-error.html
@@ -374,40 +390,81 @@ function resetDb {
 		~/bin/rake environment elasticsearch:import:model CLASS=Ontology
 	fi
 	~/bin/rake generate:metadata
-	~/bin/rake import:logicgraph
-	if [[ -f lib/tasks/hets.rake ]]; then
-		# Initially we have a chicken-and-egg-problem here: The ontohub-god
-		# service cannot be started, before the ontohub repo is checked out and
-		# prepared (done by this script). However this service is responsible for
-		# running a hets instance on port 8000, which is required to be able to
-		# 'rake hets:generate_first_instance'. So at least on a virign system we need
-		# to bootstrap, i.e. fire it up manually ... 
-		typeset X=${ pgrep -f bin/god ; }
-		if [[ -n $X ]]; then
-			Log.info 'Waiting for ontohub-god (hets-server) to come up ...'
-			integer SEC=60
-			while (( SEC > 0 )); do
-				X=${ print 'GET / HTTP/1.1\nHost: localhost\n' | \
-					netcat localhost 8000 ; }
-				[[ -n $X ]] && break
-				(( SEC-- ))
-				print -n '.'
-				sleep 1
-			done
-			print '.'
-		fi
-		if [[ -z $X ]]; then
-			Log.info 'Bootstrapping hets ...'
-			hets-server -X >/dev/null 2>&1 &
-			(( $? )) || X=$!
-		fi
-		if [[ -n $X ]]; then
-			~/bin/rake hets:generate_first_instance
-			[[ $X =~ ^[0-9]+ ]] && kill -9 $X
-		else
-			Log.warn 'Skipping "rake hets:generate_first_instance"'
-		fi
+
+	# if there is no single user registered in the DB, the rake tasks below fail
+	X=${ psql -A -t -U ${DBUSER} -d ${DB} \
+			-c 'select COUNT(*) from users where admin=true;' ; }
+	if [[ $X == '0' ]]; then
+		X=${ openssl rand -hex 64 ; }
+		print 'me = User.new name: "import", email: "import@localhost",' \
+			"password: '$X'\nme.admin = true\n"'me.confirm!\nexit' \
+			>tmp/1st_user.rb
+		~/bin/rails r tmp/1st_user.rb
+		Log.info 'You may register yourself within the ontohub web app and' \
+			"than use   ${PROG} -A 'your user name'   to make you an ontohub" \
+			'web app admin.'
 	fi
+
+	~/bin/rake import:logicgraph
+
+	[[ -f lib/tasks/hets.rake ]] || return
+
+	# All remaining tasks need a running hets server
+	typeset X=${ pgrep -f bin/god ; }
+	[[ -z $X ]] && ~/etc/god-serv.sh start	# fresh install
+	Log.info 'Waiting for ontohub-god (hets-server) to come up ...'
+	integer SEC=60
+	while (( SEC > 0 )); do
+		X=${ print 'GET / HTTP/1.1\nHost: localhost\n' |netcat localhost 8000; }
+		[[ -n $X ]] && break
+		(( SEC-- ))
+		print -n '.'
+		sleep 1
+	done
+	print '.'
+	if [[ -z $X ]]; then
+		Log.info 'Bootstrapping hets ...'
+		hets-server -X >/dev/null 2>&1 &
+		(( $? )) || X=$!
+	fi
+	if [[ -n $X ]]; then
+		~/bin/rake hets:generate_first_instance
+		[[ $X =~ ^[0-9]+ ]] && kill -9 $X
+	else
+		Log.warn 'Skipping "rake hets:generate_first_instance"'
+	fi
+
+	# and these tasks need even the running web app, too.
+	X=${ ~/etc/puma-serv.sh status 2>/dev/null ; }
+	[[ -z $X ]] && ~/etc/puma-serv.sh start >tmp/puma.out 2>&1 &
+	Log.info 'Waiting for puma (ontohub web app) to come up ...'
+	SEC=60
+	while (( SEC > 0 )); do
+		X=${ pgrep -f 'puma.*tcp://' ; }
+		[[ -n $X ]] && break
+		(( SEC-- ))
+		print -n '.'
+		sleep 1
+	done
+	print '.'
+	if [[ -n $X ]]; then
+		~/bin/rake generate:categories
+		~/bin/rake generate:proof_statuses
+	else
+		Log.warn 'Skipping "rake generate:{proof_statuses,categories}"'
+	fi
+}
+
+function dba {
+	typeset DB='ontohub' DBUSER='ontohub'
+	[[ -n ${CFG[renv]} && ${CFG[renv]} != 'production' ]] && DB+='_development'
+
+	if [[ -n ${CFG[admin]} ]]; then
+		CMD="UPDATE users SET admin=true where name='${CFG[admin]}';"
+	elif [[ -n ${CFG[ulist]} ]]; then
+		CMD='SELECT id,email,name,admin FROM users;'
+	fi
+	[[ -n ${CMD} ]] && psql -U ${DBUSER} -d ${DB} -c "${CMD}"
 }
 
 function doMain {
@@ -424,9 +481,11 @@ function doMain {
 
 	# just a _simple_ check - developers w/o 64bit should not develop ;-)
 	typeset LIB='/usr/lib/x86_64-linux-gnu/libQtWebKit.so'
-	if [[ ! -e ${LIB} ]] && [[ ${CFG[prod]} != '1' ]]; then
+	if [[ ! -e ${LIB} ]] && \
+		[[ -n ${CFG[renv]} && ${CFG[renv]} != 'production' ]]
+	then
 		Log.info 'Missing QtWebKit - switching to production mode.'
-		CFG[prod]=1
+		CFG[renv]='production'
 	fi
 
 	[[ -z ${GIT} ]] && Log.fatal "'git' not found - exiting." && return 3
@@ -454,16 +513,21 @@ Man.addFunc MAIN '' '[+NAME?'"$PROG"' - setup or update the ontohub application 
 [H:usage]:[function?Show the usage information for the given function if available and exit. See also option \b-F\b.]
 [T:trace]:[fname_list?A comma or whitspace separated list of function names, which should be traced during execution.]
 [+?]
+[A:admin]:[user?Just add \badmin\b rights for the named onthub application \auser\a and exit.]
 [b:branch]:[name?The name of the branch to switch to/checkout before doing anything. Default: \b$BRANCH\b if set, otherwise use as is.]
+[C:nocommit?When the repository gets cloned, patches (if available) get applied and on success the changes commited to the local repository. Using this option prevents commiting the changes.]
 [D:datadir]:[dir?The base directory where the application/git gets redirected to store its data. Since the application has no appropriate setting but uses always $PassengerAppRoot/data/* alias ~ontohub/ontohub/data/* for git data, \bdata\b gets symlinked to the given \adir\a if it actually exists. Default: '"${CFG[datadir]}"']
 [d:destbase]:[dir?The directory where the gems \bbundler\b should store the application gems. The bundler creates a \bruby\b/\aVERSION\a sub directory beneath it, where it will store all the libs, docs and utilities. Default: '"${CFG[dest]}"']
-[P:production?Build the production environment, i.e. do not include development or test related modules. Usually used on servers to reduce runtime dependencies and space consumption.]
+[e:env?The rails environment to use. Default is \bproduction\b.]
+[L:list?Get a summary of registered ontohub users.]
 [R:reset?Reset and seed the database after the a successful deployment of the web application.]
 [r:repobase]:[dir?The directory which contains/will contain the OAR clone \bontohub\b. Default: '"${CFG[repo]}"']
 [u:update?Just clone/update the repository but do not build the gems.]
 [+NOTES?Just in case: If deployed in "production" mode \bconfig/environments/production.rb\b will be used, otherwise \bdevelopment.rb\b or \btest.rb\b. To run rails without Apache httpd in front of it in production mode (i.e. cd ~ontohub/ontohub; rails server), one needs to set \bconfig.serve_static_assets = true\b in \bproduction.rb\b to avoid ActionController::RoutingErrors for static content.]
 '
 X="${ print ${Man.FUNC[MAIN]} ; }"
+CFG[commit]=1
+integer DBA=0
 while getopts "${X}" option ; do
 	case "$option" in
 		h) showUsage ${PROG} MAIN ; exit 0 ;;
@@ -477,11 +541,14 @@ while getopts "${X}" option ; do
 			;;
 		T) [[ ${OPTARG} == 'ALL' ]] && typeset -ft ${ typeset +f ; } || \
 			typeset -ft ${OPTARG//,/ } ;;
+		A) CFG[admin]="${OPTARG}"; DBA=1 ;;
 		b) CFG[branch]="${OPTARG// /_}" ;;
+		C) CFG[commit]=0 ;;
 		D) [[ -d ${OPTARG} ]] && CFG[datadir]="${OPTARG}" || \
 			Log.warn "Git data dir '${OPTARG}' doesn't exist - ignored." ;;
 		d) CFG[dest]="${OPTARG}" ;;
-		P) CFG[prod]=1 ;;
+		e) CFG[renv]="${OPTARG}" ;;
+		L) CFG[ulist]=1 ; DBA=1 ;;
 		r) CFG[repo]="${OPTARG%%/}/ontohub" ;;
 		R) CFG[reset]=1 ;;
 		u) CFG[update]=1 ;;
@@ -490,4 +557,9 @@ done
 X=$((OPTIND-1))
 shift $X && OPTIND=1
 
-doMain "$@" && Log.info 'Done.'
+if (( DBA )); then
+	dba
+else
+	doMain "$@" 
+fi
+(( $? )) || Log.info 'Done.'

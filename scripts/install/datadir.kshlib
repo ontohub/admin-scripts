@@ -337,7 +337,7 @@ function createUsers {
 				[[ -d "${ZROOT}/${ZUHOME}/$F" ]] && \
 					chmod 0700 "${ZROOT}/${ZUHOME}/$F"
 			done
-			rm -f ${ZROOT}/${ZUHOME}/etc/{log,man,utils,datadir}.kshlib\
+			rm -f ${ZROOT}/${ZUHOME}/etc/{log,man,utils,lxc-datadir}.kshlib\
 				${ZROOT}/${ZUHOME}/etc/gzip
 			# hmm - ubuntu ...
 			find ${ZROOT}/${ZUHOME} \( -type d -o -type f \) -exec chown ${ZUSER[$U].uid}:${ZUSER[$U].gid} {} \;
@@ -666,7 +666,7 @@ Man.addFunc addDataDirs2zone '' '[+NAME?addDataDirs2zone - print out the zonecfg
 [+ENVIRONMENT VARIABLES]{' "${ Man.varUsage DATADIR; }" '}
 [+SEE ALSO?\bcheckDatadirsPre()\b, \bDatadirObj_t\b]'
 function addDataDirs2zone {
-	if [[ ${ uname -s ; } != 'SunOS' ]]; then
+	if [[ ${OSNAME} != 'SunOS' ]]; then
 		typeset -n CFGFSTAB=$1 HOOKFSTAB=$2
 		addDataDirs2lxc CFGFSTAB HOOKFSTAB
 		return $?
