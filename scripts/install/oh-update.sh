@@ -23,7 +23,7 @@ CFG[url]='https://github.com/ontohub/ontohub.git'
 CFG[repo]=${HOME%%/}/ontohub CFG[dest]=${HOME%%/}
 CFG[datadir]='/data/git'
 
-LIC='[-?$Id: oh-update.sh,v 0a7ae1797527 2015-02-26 17:49:11Z jel+opengrok $ ]
+LIC='[-?$Id: oh-update.sh,v e10b283f0a2f 2015-03-15 20:47:22Z jel+opengrok $ ]
 [-copyright?Copyright (c) 2014 Jens Elkner. All rights reserved.]
 [-license?CDDL 1.0]'
 typeset -r SDIR=${.sh.file%/*} FPROG=${.sh.file} PROG=${FPROG##*/}
@@ -70,7 +70,7 @@ function firstTimeChanges {
 	Log.info 'Applying 1st time aka only once modifications ...'
 
 	# base config for the first time, only.
-	typeset A B HNAME SET RUBY=${ whence ruby ; }
+	typeset A B HNAME SET
 	integer I
 	A=( ${ getent hosts ${ hostname ; } ; } )
 	for (( I=1 ; I < ${#A[@]}; I++ )); do
@@ -96,9 +96,6 @@ function firstTimeChanges {
 	# oh my goodness, this stuff is whitespace sensitive!
 	sed -e '/\.development-state/ { p; s,\.dev.*,  display: none, }' \
 		-i app/assets/stylesheets/navbar.css.sass
-	# when ~ontohub/ontohub/git/bin/git-shell gets fired, no shell profiles are
-	# read and thus env ruby would not found a ruby not installed in /usr/bin
-	sed -i -e "1 s,^.*,#\!${RUBY}," git/bin/git-shell
 
 	[[ Gemfile -nt Gemfile.lock ]] && rm Gemfile.lock
 
@@ -277,6 +274,11 @@ function buildGems {
 
 	[[ -z ${RUBY} ]] && Log.fatal "No 'ruby' installed?" && return 1
 	cd "${CFG[repo]}" || return 4
+
+	# when ~ontohub/ontohub/git/bin/git-shell gets fired, no shell profiles are
+	# read and thus env ruby would not find a ruby not installed in /usr/bin
+	sed -i -e "1 s,^.*,#\!${RUBY}," git/bin/git-shell
+
 	# actually there is no need to comit if Gemfile is properly constructed...
 	[[ -e Gemfile.lock ]] || COMMIT=1
 

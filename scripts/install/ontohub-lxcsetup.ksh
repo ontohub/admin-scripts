@@ -127,7 +127,7 @@ customizeRunningZone
 [[ ${RAILS_ENV} != 'production' ]] && \
 	sed -re '/^webservd:/ s,:[^:]+$,:/bin/bash,' -i ${ZROOT}/etc/passwd
 
-F="${SDIR}/files/ssh_keys/authorized_keys.bremen"
+F="${SDIR}/files/ssh_keys/authorized_keys2.bremen"
 if [[ -f $F ]]; then
 	Log.info 'Adding authorized_keys.bremen ...'
 	# neither git nor redis or ruby!
